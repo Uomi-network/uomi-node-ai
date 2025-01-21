@@ -5,60 +5,102 @@ import random
 import numpy as np
 import time
 import os
-import sys
 import json
 
+# INITIALIZER
+##############################################################################################
+
+# Currently we support only one model
+# In the future we will support multiple models on same time...
 model_name = "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4"
 
+# Detect if system is valid
+print("🕦 Checking system...")
+system_valid = False
+if os.path.exists("/proc/cpuinfo") and os.path.exists("/proc/meminfo") and os.path.exists("/proc/uptime"):
+  cpuinfo = open("/proc/cpuinfo").read()
+  meminfo = open("/proc/meminfo").read()
+  uptime = open("/proc/uptime").read()
+  if cpuinfo and meminfo and uptime:
+    system_valid = True
+if not system_valid:
+  print("🚨 System is not valid. Setting only development environment...\n")
+else:
+  print("✅ System is valid!\n")
+
 # Setup environment variables
-print("Setting up environment variables...")
+print("🕦 Setting up environment variables...")
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+print("✅ environment variables set!\n")
 
 # Be sure cuda is available
-print("Checking CUDA availability...")
+print("🕦 Checking CUDA availability...")
 cuda_available = torch.cuda.is_available()
 if not cuda_available:
-  print("CUDA is not available. Exiting...")
-  sys.exit(1)
+  print("🚨 CUDA is not available.\n")
+else:
+  print("✅ CUDA is available!\n")
 
 # Make model deterministic
-print("Setting up model deterministic...")
-random.seed(0) # Sets the seed for Python's built-in random module
-np.random.seed(0) # Sets the seed for NumPy's random number generator
-torch.manual_seed(0) # Sets the seed for PyTorch's CPU random number generator
-torch.cuda.manual_seed(0) # Sets the seed for the current GPU device
-torch.cuda.manual_seed_all(0) # Sets the seed for all available GPU devices
-torch.use_deterministic_algorithms(True, warn_only=True) # Ensures that only deterministic algorithms are used
-torch.backends.cuda.matmul.allow_tf32 = False # Disables TensorFloat32 (TF32) on matmul ops
-torch.backends.cudnn.allow_tf32 = False # Disables TF32 on cuDNN
-torch.backends.cudnn.benchmark = False # Disables the cuDNN auto-tuner
-torch.backends.cudnn.deterministic = True # Forces cuDNN to use deterministic algorithms
-torch.backends.cudnn.enabled = False # Disables cuDNN entirely
+print("🕦 Setting up model deterministic...")
+if system_valid:
+  random.seed(0) # Sets the seed for Python's built-in random module
+  np.random.seed(0) # Sets the seed for NumPy's random number generator
+  torch.manual_seed(0) # Sets the seed for PyTorch's CPU random number generator
+  torch.cuda.manual_seed(0) # Sets the seed for the current GPU device
+  torch.cuda.manual_seed_all(0) # Sets the seed for all available GPU devices
+  torch.use_deterministic_algorithms(True, warn_only=True) # Ensures that only deterministic algorithms are used
+  torch.backends.cuda.matmul.allow_tf32 = False # Disables TensorFloat32 (TF32) on matmul ops
+  torch.backends.cudnn.allow_tf32 = False # Disables TF32 on cuDNN
+  torch.backends.cudnn.benchmark = False # Disables the cuDNN auto-tuner
+  torch.backends.cudnn.deterministic = True # Forces cuDNN to use deterministic algorithms
+  torch.backends.cudnn.enabled = False # Disables cuDNN entirely
+  print("✅ model deterministic set!\n")
+else:
+  print("🤖 skipping deterministic setup because system is not valid.\n")
 
 # Load the model and tokenizer
-print("Loading model...")
-start_time = time.time()
-model = AutoModelForCausalLM.from_pretrained(
-  model_name,
-  device_map="auto"
-)
-model.eval()
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-end_time = time.time()
-time_taken = end_time - start_time
-print(f"Model loaded in {time_taken:.2f} seconds!")
+print("🕦 Loading model...")
+if system_valid:
+  start_time = time.time()
+  model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    device_map="auto"
+  )
+  model.eval()
+  tokenizer = AutoTokenizer.from_pretrained(model_name)
+  end_time = time.time()
+  time_taken = end_time - start_time
+  print(f"✅ Model loaded in {time_taken:.2f} seconds!\n")
+else:
+  print("🤖 skipping model loading because system is not valid.\n")
 
 # Setup the Flask app
-print("Setting up Flask app...")
+print("🕦 Setting up Flask app...")
 app = Flask(__name__)
+request_running = False # Flag to indicate if a request is currently running or not
+print("✅ Flask app set up!\n")
 
-request_running = False
+# STATUS API
+##############################################################################################
+
+@app.route('/status', methods=['GET'])
+def status_json():
+  cuda_available = torch.cuda.is_available()
+
+  return jsonify({
+    "request_running": request_running,
+    "cuda_available": cuda_available,
+    "models_available": [model_name],
+  })
+
+# RUN API
+##############################################################################################
 
 @app.route('/run', methods=['POST'])
 def run_json():    
-  global request_running
   try:
     print("Received request...")
     data = request.get_json()
@@ -153,6 +195,9 @@ def run_json():
     request_running = False
     return jsonify({"error": str(e)}), 500
 
+# STARTUP
+##############################################################################################
+
 if __name__ == '__main__':
-  print("Starting Flask app...")
+  print("🚀 Starting Flask app...")
   app.run(host='0.0.0.0', port=8888, debug=False)
