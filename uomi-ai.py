@@ -107,7 +107,8 @@ def status_json():
 ##############################################################################################
 
 @app.route('/run', methods=['POST'])
-def run_json():    
+def run_json():
+  global request_running  
   try:
     print("Received request...")
     data = request.get_json()
