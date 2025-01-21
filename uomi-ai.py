@@ -64,20 +64,21 @@ else:
   print("🤖 skipping deterministic setup because system is not valid.\n")
 
 # Load the model and tokenizer
-print("🕦 Loading model...")
+print("🕦 Loading model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4...")
+model_qwen = None
 if system_valid:
   start_time = time.time()
-  model = AutoModelForCausalLM.from_pretrained(
-    model_name,
+  model_qwen = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
     device_map="auto"
   )
-  model.eval()
-  tokenizer = AutoTokenizer.from_pretrained(model_name)
+  model_qwen.eval()
+  tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4")
   end_time = time.time()
   time_taken = end_time - start_time
-  print(f"✅ Model loaded in {time_taken:.2f} seconds!\n")
+  print(f"✅ Model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4 loaded in {time_taken:.2f} seconds!\n")
 else:
-  print("🤖 skipping model loading because system is not valid.\n")
+  print("🤖 skipping model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4 loading because system is not valid.\n")
 
 # Setup the Flask app
 print("🕦 Setting up Flask app...")
@@ -177,7 +178,7 @@ def run_json():
         tokenize=False,
         add_generation_prompt=True,
       )
-      model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+      model_inputs = tokenizer([text], return_tensors="pt").to(model_qwen.device)
 
       # Print the number of tokens in the input
       num_tokens = len(model_inputs['input_ids'][0])
@@ -185,7 +186,7 @@ def run_json():
 
       # Generate the response
       start_time = time.time()
-      generated_ids = model.generate(
+      generated_ids = model_qwen.generate(
         **model_inputs,
         max_new_tokens=8192,
         do_sample=False,       # Disable sampling
