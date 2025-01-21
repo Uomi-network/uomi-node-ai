@@ -10,9 +10,11 @@ import json
 # INITIALIZER
 ##############################################################################################
 
-# Currently we support only one model
-# In the future we will support multiple models on same time...
-model_name = "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4"
+UOMI_ENGINE_PALLET_VERSION = 2
+
+models_available = [
+  "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
+]
 
 # Detect if system is valid
 print("🕦 Checking system...")
@@ -91,9 +93,13 @@ def status_json():
   cuda_available = torch.cuda.is_available()
 
   return jsonify({
-    "request_running": request_running,
-    "cuda_available": cuda_available,
-    "models_available": [model_name],
+    "UOMI_ENGINE_PALLET_VERSION": UOMI_ENGINE_PALLET_VERSION,
+    "details": {
+      "system_valid": system_valid,
+      "request_running": request_running,
+      "cuda_available": cuda_available,
+      "models_available": models_available,
+    }
   })
 
 # RUN API
@@ -105,12 +111,12 @@ def run_json():
     print("Received request...")
     data = request.get_json()
 
-    # Validate the input
+    # Validate parameters
     # be sure model name parameter is present
     if "model" not in data:
       return jsonify({"error": "model parameter is required"}), 400
     # be sure model parameter is correct
-    if data["model"] != model_name:
+    if data["model"] not in models_available:
       return jsonify({"error": "model parameter is incorrect"}), 400
     # be sure input parameter is present
     if "input" not in data:
@@ -119,76 +125,96 @@ def run_json():
     if not isinstance(data["input"], str):
       return jsonify({"error": "input parameter must be a string"}), 400
 
-    # try to parse input as a json object
-    input_data = None
-    try:
-      input_data = json.loads(data["input"])
-    except:
-      return jsonify({"error": "input parameter must be a valid json string"}), 400
+    # Initialize response variables
+    response = None
+    time_taken = None
+    total_tokens_generated = None
+    tokens_per_second = None
+
+    # Model specific code
+    # -------------------------------------------------------------------------- Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4
+    if data["model"] == "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4":
+      # fallback if system is not valid
+      if not system_valid:
+        response = "System is not valid. Setting only development environment..."
+        return jsonify({"response": response, "time_taken": 0, "total_tokens_generated": 0, "tokens_per_second": 0})
+
+      # try to parse input as a json object
+      input_data = None
+      try:
+        input_data = json.loads(data["input"])
+      except:
+        return jsonify({"error": "input parameter must be a valid json string"}), 400
+      
+      # be sure messages input is a list
+      if not isinstance(input_data["messages"], list):
+        return jsonify({"error": "messages parameter must be a list"}), 400
+      # be sure messages are objects with role and content keys, be sure content is a string and role is a string with values "system" or "user" or "assistant"
+      for message in input_data["messages"]:
+        if not isinstance(message, dict):
+          return jsonify({"error": "each message must be an object"}), 400
+        if "role" not in message:
+          return jsonify({"error": "each message must have a role key"}), 400
+        if "content" not in message:
+          return jsonify({"error": "each message must have a content key"}), 400
+        if not isinstance(message["role"], str):
+          return jsonify({"error": "each message role must be a string"}), 400
+        if not isinstance(message["content"], str):
+          return jsonify({"error": "each message content must be a string"}), 400
+        if message["role"] not in ["system", "user", "assistant"]:
+          return jsonify({"error": "each message role must be 'system', 'user', or 'assistant'"}), 400
+
+      # If another request is running wait for it to finish
+      if request_running:
+        time_start = time.time()
+        while request_running and time.time() - time_start < 60:
+          time.sleep(1)
+      request_running = True
+      
+      # Tokenize the messages
+      text = tokenizer.apply_chat_template(
+        input_data["messages"],
+        tokenize=False,
+        add_generation_prompt=True,
+      )
+      model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+      # Print the number of tokens in the input
+      num_tokens = len(model_inputs['input_ids'][0])
+      print(f"Number of input tokens: {num_tokens}")
+
+      # Generate the response
+      start_time = time.time()
+      generated_ids = model.generate(
+        **model_inputs,
+        max_new_tokens=8192,
+        do_sample=False,       # Disable sampling
+        num_beams=1,           # Use greedy decoding, no beam search randomness
+        temperature=1,         # No randomness in distribution scaling
+        top_k=None,            # Disable top-k sampling
+        top_p=None             # Disable nucleus (top-p) sampling
+      )
+      end_time = time.time()
+      time_taken = end_time - start_time
+      print(f"Time to generate response: {time_taken:.2f} seconds")
+      total_tokens_generated = sum(len(ids) for ids in generated_ids)
+      print(f"Total tokens generated: {total_tokens_generated}")
+      tokens_per_second = total_tokens_generated / time_taken if time_taken > 0 else 0
+      print(f"Average tokens per second: {tokens_per_second}")
+
+      # Post-process the generated IDs
+      generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+      ]
+
+      response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+      request_running = False
+
+    # -------------------------------------------------------------------------- Unsupported model
+    else:
+      return jsonify({"error": "model parameter is not supported yet"}), 400
     
-    # be sure messages input is a list
-    if not isinstance(input_data["messages"], list):
-      return jsonify({"error": "messages parameter must be a list"}), 400
-    # be sure messages are objects with role and content keys, be sure content is a string and role is a string with values "system" or "user" or "assistant"
-    for message in input_data["messages"]:
-      if not isinstance(message, dict):
-        return jsonify({"error": "each message must be an object"}), 400
-      if "role" not in message:
-        return jsonify({"error": "each message must have a role key"}), 400
-      if "content" not in message:
-        return jsonify({"error": "each message must have a content key"}), 400
-      if not isinstance(message["role"], str):
-        return jsonify({"error": "each message role must be a string"}), 400
-      if not isinstance(message["content"], str):
-        return jsonify({"error": "each message content must be a string"}), 400
-      if message["role"] not in ["system", "user", "assistant"]:
-        return jsonify({"error": "each message role must be 'system', 'user', or 'assistant'"}), 400
-
-    # If another request is running wait for it to finish
-    if request_running:
-      time_start = time.time()
-      while request_running and time.time() - time_start < 60:
-        time.sleep(1)
-    request_running = True
-    
-    # Tokenize the messages
-    text = tokenizer.apply_chat_template(
-      input_data["messages"],
-      tokenize=False,
-      add_generation_prompt=True,
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-    # Print the number of tokens in the input
-    num_tokens = len(model_inputs['input_ids'][0])
-    print(f"Number of input tokens: {num_tokens}")
-
-    # Generate the response
-    start_time = time.time()
-    generated_ids = model.generate(
-      **model_inputs,
-      max_new_tokens=8192,
-      do_sample=False,       # Disable sampling
-      num_beams=1,           # Use greedy decoding, no beam search randomness
-      temperature=1,         # No randomness in distribution scaling
-      top_k=None,            # Disable top-k sampling
-      top_p=None             # Disable nucleus (top-p) sampling
-    )
-    end_time = time.time()
-    time_taken = end_time - start_time
-    print(f"Time to generate response: {time_taken:.2f} seconds")
-    total_tokens_generated = sum(len(ids) for ids in generated_ids)
-    print(f"Total tokens generated: {total_tokens_generated}")
-    tokens_per_second = total_tokens_generated / time_taken if time_taken > 0 else 0
-    print(f"Average tokens per second: {tokens_per_second}")
-
-    # Post-process the generated IDs
-    generated_ids = [
-      output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    request_running = False
+    # Return the response
     return jsonify({"response": response, "time_taken": time_taken, "total_tokens_generated": total_tokens_generated, "tokens_per_second": tokens_per_second})
   except Exception as e:
     print("Error:", str(e))
