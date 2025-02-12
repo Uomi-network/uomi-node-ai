@@ -23,3 +23,5 @@ pip install transformers
 conda install numpy=1.24
 pip install flash-attn --no-build-isolation
 pip install flask
+pip install autoawq
+pip install triton==3.2.0
