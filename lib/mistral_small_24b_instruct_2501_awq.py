@@ -13,21 +13,21 @@ class MistralSmall24bInstruct2501Awq(lib.ModelRunner.ModelRunner):
 
     # be sure messages input is a list
     if not isinstance(input_data["messages"], list):
-      self._generate_error("messages parameter must be a list")
+      return self._generate_error("messages parameter must be a list")
     # be sure messages are objects with role and content keys, be sure content is a string and role is a string with values "system" or "user" or "assistant"
     for message in input_data["messages"]:
       if not isinstance(message, dict):
-        self._generate_error("each message must be an object")
+        return self._generate_error("each message must be an object")
       if "role" not in message:
-        self._generate_error("each message must have a role key")
+        return self._generate_error("each message must have a role key")
       if "content" not in message:
-        self._generate_error("each message must have a content key")
+        return self._generate_error("each message must have a content key")
       if not isinstance(message["role"], str):
-        self._generate_error("each message role must be a string")
+        return self._generate_error("each message role must be a string")
       if not isinstance(message["content"], str):
-        self._generate_error("each message content must be a string")
+        return self._generate_error("each message content must be a string")
       if message["role"] not in ["system", "user", "assistant"]:
-        self._generate_error("each message role must be 'system', 'user', or 'assistant'")
+        return self._generate_error("each message role must be 'system', 'user', or 'assistant'")
 
     response = model_manager.run_inference(input_data["messages"])
     return self._generate_output(response)
