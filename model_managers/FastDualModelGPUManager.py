@@ -4,13 +4,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory
 from accelerate.hooks import remove_hook_from_submodules
+from lib.ModelManager import ModelManager
 
-class FastDualModelGPUManager:
+class FastDualModelGPUManager(ModelManager):
   def __init__(self, models_config):
     self.models_config = models_config
     self.models = {}
     self.tokenizers = {}
     self.current_model = None
+    self.default_model = models_config[0]["name"]
     self.gpu_devices = [0, 1]
     self.seed = 1312
 
@@ -52,6 +54,18 @@ class FastDualModelGPUManager:
 
     switch_time = time.time() - start_time
     print(f"[Switch] Switching to model '{model_name}' took {switch_time:.2f} s")
+    return True
+  
+  # Clear the current model from GPU memory.
+  def clear_model(self):
+    if not self.current_model:
+      print("[Clear] No model loaded")
+      return False
+
+    print(f"[Clear] Clearing model '{self.current_model}'...")
+    model = self.models[self.current_model]
+    self._clear_gpu_memory(model)
+    self.current_model = None
     return True
 
   # Run an inference on the current model.

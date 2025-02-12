@@ -1,9 +1,8 @@
 import json
-import lib.ModelRunner
+from lib.ModelRunner import ModelRunner
 
-class DobbyMiniUnhingedLlama318b(lib.ModelRunner.ModelRunner):
+class ChatRunner(ModelRunner):
   def run(self, input, model_manager):
-    print("Running DobbyMiniUnhingedLlama318b model...", input)
     # try to parse input as a json object
     input_data = None
     try:
@@ -31,3 +30,4 @@ class DobbyMiniUnhingedLlama318b(lib.ModelRunner.ModelRunner):
 
     response = model_manager.run_inference(input_data["messages"])
     return self._generate_output(response)
+

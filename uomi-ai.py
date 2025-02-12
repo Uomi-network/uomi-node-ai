@@ -2,11 +2,14 @@ import time
 import os
 import sys
 from flask import Flask, request, jsonify
-import lib.System
-import lib.FastDualModelGPUManager
-import lib.mistral_small_24b_instruct_2501_awq
-import lib.deepseek_r1_distill_qwen_14b_awq
-import lib.dobby_mini_unhinged_llama_31_8b
+
+from lib.System import System
+
+from model_managers.FastDualModelGPUManager import FastDualModelGPUManager
+from model_managers.SanaManager import SanaManager
+
+from model_runners.ChatRunner import ChatRunner
+from model_runners.ImageRunner import ImageRunner
 
 print(' ')
 print('|' * 50)
@@ -19,31 +22,38 @@ print(' ')
 UOMI_ENGINE_PALLET_VERSION = 3
 print("UOMI_ENGINE_PALLET_VERSION:", UOMI_ENGINE_PALLET_VERSION)
 
-MODELS = [
-  # { "name": "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4", "deterministic": True }, # UOMI Model ID 1 - Removed used on UOMI_ENGINE_PALLET_VERSION <= 2
-  { "name": "casperhansen/mistral-small-24b-instruct-2501-awq", "deterministic": True, "runner": lib.mistral_small_24b_instruct_2501_awq.MistralSmall24bInstruct2501Awq() }, # UOMI Model ID 1
-  { "name": "casperhansen/deepseek-r1-distill-qwen-14b-awq", "deterministic": False, "runner": lib.deepseek_r1_distill_qwen_14b_awq.DeepseekR1DistillQwen14bAwq() }, # UOMI Model ID 2
-  # { "name": "SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B", "deterministic": False, "runner": lib.dobby_mini_unhinged_llama_31_8b.DobbyMiniUnhingedLlama318b() } # UOMI Model ID 3
-]
-print("MODELS:", MODELS)
-
 USE_CACHE = False
 print("USE_CACHE:", USE_CACHE)
 print(' ')
 
+MODELS = [
+  { "name": "casperhansen/mistral-small-24b-instruct-2501-awq", "deterministic": True, "manager": "FastDualModelGPUManager", "runner": "ChatRunner" }, # UOMI Model ID 1
+  # { "name": "casperhansen/deepseek-r1-distill-qwen-14b-awq", "deterministic": False, "runner": "ChatRunner" }, # UOMI Model ID 2
+  # { "name": "SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B", "deterministic": False, "runner": "ChatRunner" } # UOMI Model ID 3
+  { "name": "Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers", "deterministic": False, "manager": "SanaManager", "runner": "ImageRunner" }, # UOMI Model ID 4
+]
+print("MODELS:", MODELS)
+
 # Setup system
-system = lib.System.System()
+system = System()
 sys.exit(0) if not system.check_system_requirements() else 1
 sys.exit(0) if not system.check_cuda_availability() else 1
 system.setup_environment_variables()
 print("✅ System requirements met")
 print(' ')
 
-# Load models
-model_manager = lib.FastDualModelGPUManager.FastDualModelGPUManager(MODELS)
-model_manager.switch_model(MODELS[0]["name"])
+# Load model managers
+fast_dual_model_gpu_models = [model for model in MODELS if model["manager"] == "FastDualModelGPUManager"]
+sana_models = [model for model in MODELS if model["manager"] == "SanaManager"]
+fast_dual_model_gpu_manager = FastDualModelGPUManager(fast_dual_model_gpu_models) if fast_dual_model_gpu_models else None
+sana_manager = SanaManager(sana_models) if sana_models else None
 print("✅ Models loaded")
 print(' ')
+
+# Load model runners
+chat_runner = ChatRunner()
+image_runner = ImageRunner()
+print("✅ Runners loaded")
 
 # Setup the Flask app
 app = Flask(__name__)
@@ -81,15 +91,17 @@ def run_json():
   # be sure model name parameter is present
   if "model" not in data:
     return jsonify({"error": "model parameter is required"}), 400
-  # be sure model parameter is correct
-  if data["model"] not in [model["name"] for model in MODELS]:
-    return jsonify({"error": "model parameter is incorrect"}), 400
   # be sure input parameter is present
   if "input" not in data:
     return jsonify({"error": "input parameter is required"}), 400
   # be sure input parameter is a string
   if not isinstance(data["input"], str):
     return jsonify({"error": "input parameter must be a string"}), 400
+
+  # Find model config
+  model_config = MODELS[[model["name"] for model in MODELS].index(data["model"])]
+  if not model_config:
+    return jsonify({"error": "model not found"}), 400
 
   # Wait for the previous request to finish
   if request_running:
@@ -99,18 +111,33 @@ def run_json():
   request_running = True
   
   try:
-    # Load the model config
-    model_config = MODELS[[model["name"] for model in MODELS].index(data["model"])]
+    # Run the model to get the response
+    model_runner = None
+    if model_config["runner"] == "ChatRunner":
+      model_runner = chat_runner
+    elif model_config["runner"] == "ImageRunner":
+      model_runner = image_runner
+    else:
+      return jsonify({"error": "model runner not found"}), 400
 
-    # Switch to the requested model
+    # Find the model manager
+    model_manager = None
+    if model_config["manager"] == "FastDualModelGPUManager":
+      model_manager = fast_dual_model_gpu_manager
+    elif model_config["manager"] == "SanaManager":
+      model_manager = sana_manager
+    else:
+      return jsonify({"error": "model manager not found"}), 400
+    
+    # Switch to the model on the model manager
     model_manager.switch_model(model_config["name"])
 
-    # Run the model to get the response
-    output = model_config["runner"].run(data["input"], model_manager)
+    # Run the model
+    output = model_runner.run(data["input"], model_manager)
 
     # Validate the output and return an error if needed
     if not output["result"]:
-      model_manager.switch_model(MODELS[0]["name"])
+      model_manager.clear_model()
       request_running = False
       return jsonify({"error": output["error"]}), 400
 
@@ -125,12 +152,13 @@ def run_json():
           del request_cache[key]
 
     # Return the output
-    model_manager.switch_model(MODELS[0]["name"])
+    model_manager.clear_model()
     request_running = False
     return jsonify(output)
   except Exception as e:
     print("Error:", str(e))
-    model_manager.switch_model(MODELS[0]["name"])
+    fast_dual_model_gpu_manager.clear_model()
+    sana_manager.clear_model()
     request_running = False
     return jsonify({"error": str(e)}), 500
 
