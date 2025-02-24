@@ -12,7 +12,6 @@ class FastDualModelGPUManager(ModelManager):
     self.models = {}
     self.tokenizers = {}
     self.current_model = None
-    self.default_model = models_config[0]["name"]
     self.gpu_devices = [0, 1]
     self.seed = 1312
 
@@ -118,7 +117,6 @@ class FastDualModelGPUManager(ModelManager):
     print(f"[Inference] Inference on '{self.current_model}' took {gen_time:.2f} s")
 
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
 
   # Set all seeds and backend settings for deterministic behavior.
   def _set_deterministic(self):

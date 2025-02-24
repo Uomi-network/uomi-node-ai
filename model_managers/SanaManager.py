@@ -8,7 +8,6 @@ class SanaManager(ModelManager):
     self.models_config = models_config
     self.models = {}
     self.current_model = None
-    self.default_model = models_config[0]["name"]
     self.seed = 1312
 
     # Load models into CPU memory (pinned for fast GPU transfer).
