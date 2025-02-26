@@ -1,9 +1,0 @@
-{
-  "model": "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
-  "messages": [
-      {
-          "role": "system",
-          "content": "Say hello to the world!"
-      }
-  ]
-}
