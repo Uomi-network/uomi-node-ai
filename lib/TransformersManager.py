@@ -57,20 +57,14 @@ class TransformersModelManager:
             
             # Load model from disk to gpu, then clear it
             elif config.location == "disk":
+                self.current_gpu_model_name = model_name
                 self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                     config.model_name,
                     device_map="cuda",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
                     **config.model_kwargs
                 )
-                # run a sample inference to load the model to GPU
-                inputs = tokenizer("Lorem ipsum", return_tensors="pt").to("cuda")
-                self.current_gpu_model.generate(
-                    **inputs,
-                    **config.inference_kwargs,
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True
-                )
+                self.run_inference([{ "role": "system", "content": "Hello, world!" }])
                 self.clear_model()
 
             # Error if location is not cpu or disk

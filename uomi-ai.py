@@ -151,12 +151,12 @@ def run_json():
     try:
         # Generate output
         output = None
-        if TRANSFORMERS_MODEL_CONFIG[data["model"]]:
+        if data["model"] in TRANSFORMERS_MODEL_CONFIG:
             transformers_model_manager.switch_model(data["model"])
             runner = ChatRunner()
             output = runner.run(data["input"], transformers_model_manager)
             transformers_model_manager.clear_model()
-        elif SANA_MODEL_CONFIG[data["model"]]:
+        elif data["model"] in SANA_MODEL_CONFIG:
             sana_model_manager.switch_model(data["model"])
             runner = ImageRunner()
             output = runner.run(data["input"], sana_model_manager)
