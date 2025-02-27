@@ -76,4 +76,6 @@ class System:
     os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    os.environ["TRANSFORMERS_CACHE"] = "/app/models"
+    os.environ["HF_HOME"] = "/app/models"
   

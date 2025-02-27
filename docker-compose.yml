@@ -1,0 +1,18 @@
+services:
+  uomi-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: uomi-node-ai-container
+    volumes:
+      - ./:/app
+    ports:
+      - "8888:8888"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              device_ids: ['0', '1']
+    command: python uomi-ai.py

@@ -33,6 +33,7 @@ class TransformersModelManager:
         # Load all models and tokenizers on CPU
         for model_name, config in models_config.items():
             # Load tokenizer
+            print(f"Loading tokenizer for model {model_name}")
             tokenizer = AutoTokenizer.from_pretrained(
                 config.model_name,
                 **config.tokenizer_kwargs
@@ -41,10 +42,12 @@ class TransformersModelManager:
             
             # Load model on CPU
             if config.location == "cpu":
+                print(f"Loading model {model_name} on CPU")
                 model = AutoModelForCausalLM.from_pretrained(
                     config.model_name,
                     device_map="cpu",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
+                    cache_dir='/app/models',
                     **config.model_kwargs
                 )
                 # Pin memory for faster GPU transfer
@@ -57,11 +60,13 @@ class TransformersModelManager:
             
             # Load model from disk to gpu, then clear it
             elif config.location == "disk":
+                print(f"Loading model {model_name} from disk to GPU")
                 self.current_gpu_model_name = model_name
                 self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                     config.model_name,
                     device_map="cuda",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
+                    cache_dir='/app/models',
                     **config.model_kwargs
                 )
                 self.run_inference([{ "role": "system", "content": "Hello, world!" }])
@@ -106,6 +111,7 @@ class TransformersModelManager:
                 model_config.model_name,
                 device_map="cuda",
                 torch_dtype=torch.float16,  # Use float16 for memory efficiency
+                cache_dir='/app/models',
                 **model_config.model_kwargs
             )
             self.current_gpu_model_name = model_name

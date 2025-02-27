@@ -29,6 +29,7 @@ class SanaModelManager:
         
         # Load all models and tokenizers on CPU
         for model_name, config in models_config.items():
+            print(f"Loading model {model_name} on CPU")
             model = SanaPipeline.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
