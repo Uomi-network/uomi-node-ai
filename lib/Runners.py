@@ -10,10 +10,11 @@ class AbstractRunner:
             "error": message
         }
 
-    def _generate_output(self, response):
+    def _generate_output(self, response, tokens=None):
         return {
             "result": True,
-            "response": response
+            "response": response,
+            "tokens": tokens
         }
   
 class ChatRunner(AbstractRunner):
@@ -46,7 +47,7 @@ class ChatRunner(AbstractRunner):
         response = model_manager.run_inference(input_data["messages"])
         with open("ChatRunner_last.json", "w") as f:
             json.dump(response, f)
-        return self._generate_output(response)
+        return self._generate_output(response["string"], response["tokens"])
 
 class ImageRunner(AbstractRunner):
     def run(self, input, model_manager):

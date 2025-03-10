@@ -1,5 +1,4 @@
 import time
-import os
 import sys
 import traceback
 from flask import Flask, request, jsonify
