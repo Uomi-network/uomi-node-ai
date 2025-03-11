@@ -5,10 +5,7 @@ import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
-MAX_TOKENS = 200
-TEMPERATURE = 0.6
+from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE
 
 @dataclass
 class TransformersModelConfig:
@@ -51,7 +48,7 @@ class TransformersModelManager:
                     config.model_name,
                     device_map="cpu",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    cache_dir='/app/models',
+                    cache_dir=MODELS_FOLDER,
                     **config.model_kwargs
                 )
                 # Pin memory for faster GPU transfer
@@ -70,18 +67,15 @@ class TransformersModelManager:
                     config.model_name,
                     device_map="cuda",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    cache_dir='/app/models',
+                    cache_dir=MODELS_FOLDER,
                     **config.model_kwargs
                 )
-                self.run_inference([{ "role": "system", "content": "Hello, world!" }])
                 self.clear_model()
 
             # Error if location is not cpu or disk
             else:
                 raise ValueError(f"Invalid location {config.location} for model {model_name}")
 
-
-    
     def switch_model(self, model_name: str):
         """
         Switch the model on GPU to a different one.
@@ -115,7 +109,7 @@ class TransformersModelManager:
                 model_config.model_name,
                 device_map="cuda",
                 torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                cache_dir='/app/models',
+                cache_dir=MODELS_FOLDER,
                 **model_config.model_kwargs
             )
             self.current_gpu_model_name = model_name
@@ -149,15 +143,15 @@ class TransformersModelManager:
 
         print(f"Time taken to clear model: {time.time() - time_start:.2f}s")
 
-    def run_inference(self, prompt):
+    def run_batch_executions(self, prompts, on_prompt_finished):
         """
-        Run inference on the current GPU model.
+        Run inference on the current GPU model on a batch of prompts.
         
         Args:
-            prompt: Input prompt for the model
+            prompts: Input prompts for the model
         
         Returns:
-            The model's output
+            The model's outputs
         """
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
@@ -178,55 +172,61 @@ class TransformersModelManager:
             torch.backends.cudnn.benchmark = True
             torch.use_deterministic_algorithms(False)
         
-        # Perform inference using the model
+        # Convert prompts to texts
         tokenizer = self.tokenizers[self.current_gpu_model_name]
-        text = tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        texts = []
+        for prompt in prompts:
+            text = tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            texts.append(text)
 
-        # OLD VERSION: Old version of inference, without run token per token
-        # inputs = tokenizer(text, return_tensors="pt").to("cuda")
-        # outputs = self.current_gpu_model.generate(
-        #     **inputs,
-        #     **self.models_config[self.current_gpu_model_name].inference_kwargs,
-        #     pad_token_id=tokenizer.eos_token_id,
-        #     use_cache=True
-        # )
-        # output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # NEW VERSION: Inference with token per token execution in batch mode with batch size forced to 1
-        inputs = tokenizer.encode(text, return_tensors="pt").to("cuda")
-        batch_size = 1
+        # Convert texts to tensors
         all_input_ids = []
-        all_input_ids.append(inputs)
+        for text in texts:
+            input_ids = tokenizer.encode(
+                text,
+                return_tensors="pt"
+            ).to("cuda")
+            all_input_ids.append(input_ids)
+        
         # Initialize tracking variables for each sequence in the batch
+        batch_size = len(prompts)
         all_output_tokens = [[] for _ in range(batch_size)]
         first_new_token_ids = [None for _ in range(batch_size)]
         active_batch_indices = list(range(batch_size))
+
         # Create tracking for prompt lengths
         prompt_lengths = [ids.shape[1] for ids in all_input_ids]
         max_prompt_length = max(prompt_lengths)
+
         # Pre-allocate tensors with enough space for full sequence (prompt + all output tokens)
-        full_sequence_length = max_prompt_length + MAX_TOKENS + 10
+        full_sequence_length = max_prompt_length + TRANSFORMERS_INFERENCE_MAX_TOKENS + 10
+
         # Create padded input tensors with attention masks
         batched_input_ids = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
         batched_attention_masks = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
+
         # Fill in the prompt portions
         for i, input_ids in enumerate(all_input_ids):
             seq_len = input_ids.shape[1]
             batched_input_ids[i, :seq_len] = input_ids.squeeze(0)
             batched_attention_masks[i, :seq_len] = 1
+
         # Track current token position for each sequence (starts at end of prompt)
         current_positions = prompt_lengths.copy()
+
         # Get the ID for the </s> token
         eos_token_id = tokenizer.eos_token_id
+
         # Track which sequences have completed (generated </s>)
         completed_sequences = [False] * batch_size
+
         # Process tokens step by step
-        for step in range(MAX_TOKENS):
-            print(f"Step {step + 1}/{MAX_TOKENS}")
+        for step in range(TRANSFORMERS_INFERENCE_MAX_TOKENS):
+            print(f"Step {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
             if not active_batch_indices:
                 break  # All inferences have completed
             # Get active batch
@@ -241,16 +241,22 @@ class TransformersModelManager:
                 last_pos = current_positions[original_idx] - 1
                 next_token_logits = outputs.logits[batch_pos, last_pos, :].unsqueeze(0)
                 # Apply temperature (if not 1.0)
-                if TEMPERATURE != 1.0:
-                    next_token_logits = next_token_logits / TEMPERATURE
+                if TRANSFORMERS_INFERENCE_TEMPERATURE != 1.0:
+                    next_token_logits = next_token_logits / TRANSFORMERS_INFERENCE_TEMPERATURE
                 # Convert to probabilities
                 probs = F.softmax(next_token_logits, dim=-1)
                 # Get top-k tokens by probability
                 top_probs, top_indices = probs.topk(5, dim=-1)
+                top_tokens = {}
+                for i, idx in enumerate(top_indices[0]):
+                    prob = probs[0, idx].item()
+                    top_tokens[idx.item()] = {
+                        "prob": prob,
+                        "index": i
+                    }
                 # Sample from the top-k tokens
                 next_token_id = top_indices.select(-1, torch.multinomial(top_probs, num_samples=1).item()).unsqueeze(0)
                 selected_token_id = next_token_id.item()
-                all_output_tokens[original_idx].append(selected_token_id)
                 # Record the first token if this is the first step
                 if step == 0:
                     first_new_token_ids[original_idx] = selected_token_id
@@ -259,24 +265,26 @@ class TransformersModelManager:
                 batched_input_ids[original_idx, pos] = selected_token_id
                 batched_attention_masks[original_idx, pos] = 1
                 current_positions[original_idx] += 1
+                
+                # Store the token on all_output_tokens
+                all_output_tokens[original_idx].append([selected_token_id, top_tokens[selected_token_id]["index"]])
                 # Check if the generated token is the </s> token
                 if selected_token_id == eos_token_id:
                     completed_sequences[original_idx] = True
                 # Only keep sequences that haven't generated </s> in the active batch
-                if not completed_sequences[original_idx]:
+                if completed_sequences[original_idx]:
+                    prompt_text = tokenizer.decode(all_input_ids[original_idx].squeeze(0).tolist(), skip_special_tokens=True)
+                    string = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
+                    string = string[len(prompt_text):]
+                    output = {
+                        "string": string,
+                        "tokens": all_output_tokens[original_idx],
+                    }
+                    on_prompt_finished(original_idx, output)
+                else:
                     new_active_batch_indices.append(original_idx)
             # Update active batch indices
             active_batch_indices = new_active_batch_indices
-
-        # Build final output
-        full_sequence = batched_input_ids[0, :current_positions[0]].tolist()
-        output = {
-            "string": tokenizer.decode(full_sequence, skip_special_tokens=False),
-            "tokens": all_output_tokens[0],
-        }
-
-        print(f"Time taken for inference: {time.time() - start_time:.2f}s")
-        return output
 
     def get_current_model(self):
         """
@@ -303,3 +311,46 @@ class TransformersModelManager:
         if model_name not in self.tokenizers:
             raise KeyError(f"Tokenizer for model {model_name} not found")
         return self.tokenizers[model_name]
+
+TRANSFORMERS_MODEL_CONFIG = {
+    'casperhansen/mistral-small-24b-instruct-2501-awq': TransformersModelConfig(
+        model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
+        deterministic=True,
+        location="cpu",
+        model_kwargs={},
+        tokenizer_kwargs={},
+        inference_kwargs={
+            'do_sample': False,
+            'num_beams': 1,
+            'temperature': 1.0,
+            'top_p': 1.0,
+            'max_new_tokens': 8196,
+        }
+    ),
+    # 'casperhansen/deepseek-r1-distill-qwen-14b-awq': TransformersModelConfig(
+    #     model_name='casperhansen/deepseek-r1-distill-qwen-14b-awq',
+    #     deterministic=False,
+    #     location="cpu",
+    #     model_kwargs={},
+    #     tokenizer_kwargs={},
+    #     inference_kwargs={
+    #         'do_sample': True,
+    #         'temperature': 0.7,
+    #         'top_p': 0.9,
+    #         'max_new_tokens': 8196,
+    #     }
+    # ),
+    # 'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
+    #     model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
+    #     deterministic=False,
+    #     location="disk",
+    #     model_kwargs={},
+    #     tokenizer_kwargs={},
+    #     inference_kwargs={
+    #         'do_sample': True,
+    #         'temperature': 0.7,
+    #         'top_p': 0.9,
+    #         'max_new_tokens': 8196,
+    #     }
+    # ),
+}
