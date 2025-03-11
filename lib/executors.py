@@ -137,3 +137,36 @@ class ChatExecutor(AbstractExecutor):
         def on_valid_input_finished(index, output):
             on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else None))
         model_manager.run_batch_checks([input["messages"] for input in valid_inputs_with_tokens], [input["proof"] for input in valid_inputs_with_tokens], on_valid_input_finished)
+
+class ImageExecutor(AbstractExecutor):
+    def _validate_input(self, input):
+        # Be sure input is a string
+        if not isinstance(input, str):
+            return self._generate_error("input parameter must be a string")
+        return None
+
+    def execute(self, inputs, model_manager, on_input_finished):
+        valid_inputs = []
+
+        # Validate inputs and exclude invalid
+        for i, input in enumerate(inputs):
+            # Validate input
+            error = self._validate_input(input)
+            if error is None:
+                valid_inputs.append({
+                    "input": input,
+                    "index": i
+                })
+            else:
+                on_input_finished(i, error)
+
+        if len(valid_inputs) == 0:
+            return
+
+        # Run valid inputs (one by one because the model is not batched)
+        for i, input in enumerate(valid_inputs):
+            output_image = model_manager.run_inference(input["input"])
+            # output_image.save("ImageExecutor_execute_last_image.jpg")
+            output_as_bytes = output_image.tobytes()
+            output_as_hex_string = output_as_bytes.hex()
+            on_input_finished(valid_inputs[i]["index"], self._generate_output(output_as_hex_string))

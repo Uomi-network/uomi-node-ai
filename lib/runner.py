@@ -2,9 +2,10 @@ import time
 import threading
 import uuid
 from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE
-from lib.executors import ChatExecutor
-from lib.TransformersModelManager import TRANSFORMERS_MODEL_CONFIG, TransformersModelManager
+from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
+from lib.TransformersModelManager import TRANSFORMERS_MODEL_CONFIG, TransformersModelManager
+from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
 class RunnerQueue:
     def __init__(self):
@@ -47,8 +48,10 @@ class RunnerExecutor:
         self.test_model_manager = TestModelManager(TEST_MODEL_CONFIG)
         if test_mode:
             self.transformers_model_manager = None
+            self.sana_model_manager = None
         else:
             self.transformers_model_manager = TransformersModelManager(TRANSFORMERS_MODEL_CONFIG)
+            self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
         self.thread.start()
@@ -62,6 +65,7 @@ class RunnerExecutor:
     def start(self):
         print('Start RunnerExecutor')
         chat_executor = ChatExecutor()
+        image_executor = ImageExecutor()
         while not self.kill:
             with self.lock:
                 pending_requests = [request for request in self.queue.get_requests().values() if request["status"] == "pending"]
@@ -81,6 +85,9 @@ class RunnerExecutor:
                     request["batch"] = [request["uuid"] for request in batch]
                 # Run the batch
                 print('🤖 Running batch with ' + str(len(batch)) + ' requests')
+                self.test_model_manager.clear_model()
+                self.transformers_model_manager.clear_model() if self.transformers_model_manager is not None else None
+                self.sana_model_manager.clear_model() if self.sana_model_manager is not None else None
                 if model in TEST_MODEL_CONFIG:
                     self.test_model_manager.switch_model(model)
                     def on_output_finished(index, output):
@@ -92,7 +99,7 @@ class RunnerExecutor:
                     else:
                         chat_executor.execute([request["request"]["input"] for request in batch], self.test_model_manager, on_output_finished)
                     self.test_model_manager.clear_model()
-                elif model in TRANSFORMERS_MODEL_CONFIG:
+                elif model in TRANSFORMERS_MODEL_CONFIG and self.transformers_model_manager is not None:
                     self.transformers_model_manager.switch_model(model)
                     def on_output_finished(index, output):
                         batch[index]["status"] = "finished"
@@ -103,6 +110,20 @@ class RunnerExecutor:
                     else:
                         chat_executor.execute([request["request"]["input"] for request in batch], self.transformers_model_manager, on_output_finished)
                     self.transformers_model_manager.clear_model()
+                elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
+                    self.sana_model_manager.switch_model(model)
+                    def on_output_finished(index, output):
+                        batch[index]["status"] = "finished"
+                        batch[index]["timestamp_finished"] = time.time()
+                        batch[index]["output"] = output
+                    if is_check:
+                        for i, request in enumerate(batch):
+                            request["status"] = "finished"
+                            request["timestamp_finished"] = time.time()
+                            request["output"] = {"result": False, "error": "Check not supported for the requested model"}
+                    else:
+                        image_executor.execute([request["request"]["input"] for request in batch], self.sana_model_manager, on_output_finished)
+                    self.sana_model_manager.clear_model()
                 else:
                     for i, request in enumerate(batch):
                         request["status"] = "finished"

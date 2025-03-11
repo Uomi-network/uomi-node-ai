@@ -9,3 +9,4 @@ pip install transformers
 pip install 'accelerate>=0.26.0'
 pip install autoawq
 pip install 'triton==3.2.0'
+pip install diffusers

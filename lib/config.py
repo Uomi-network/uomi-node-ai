@@ -1,3 +1,5 @@
+# UOMI Engine version
+UOMI_ENGINE_PALLET_VERSION = 3
 # Enable/disable usage of caching on the server
 CACHE_ENABLED = False
 # Max number of requests executed in batch mode

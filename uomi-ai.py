@@ -1,7 +1,7 @@
 import time
 import sys
 from flask import Flask, request, jsonify
-from lib.config import CACHE_ENABLED
+from lib.config import UOMI_ENGINE_PALLET_VERSION, CACHE_ENABLED
 from lib.runner import RunnerQueue, RunnerExecutor
 from lib.system import System
 
@@ -25,6 +25,16 @@ print('\n')
 
 app = Flask(__name__)
 app_cache = {}
+
+@app.route('/status', methods=['GET'])
+def status_json():
+    return jsonify({
+        "UOMI_ENGINE_PALLET_VERSION": UOMI_ENGINE_PALLET_VERSION,
+        "details": {
+            "system_valid": system.check_system_requirements(),
+            "cuda_available": system.check_cuda_availability()
+        }
+    })
 
 @app.route('/run', methods=['POST'])
 def run_json():
