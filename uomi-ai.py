@@ -4,7 +4,6 @@ from flask import Flask, request, jsonify
 from lib.config import CACHE_ENABLED
 from lib.runner import RunnerQueue, RunnerExecutor
 from lib.system import System
-from lib.TransformersModelManager import TRANSFORMERS_MODEL_CONFIG, TransformersModelManager
 
 print(' ')
 print('|' * 50)
@@ -19,12 +18,8 @@ system.setup_environment_variables()
 print('🚀 System setup completed!')
 print('\n')
 
-transformers_model_manager = TransformersModelManager(TRANSFORMERS_MODEL_CONFIG)
-print('🚀 Transformers model manager setup completed!')
-print('\n')
-
 runner_queue = RunnerQueue()
-runner_executor = RunnerExecutor(runner_queue, transformers_model_manager)
+runner_executor = RunnerExecutor(runner_queue)
 print('🚀 Runner setup completed!')
 print('\n')
 
@@ -78,6 +73,7 @@ def run_json():
         if request_data["status"] == "finished":
             print('💬 Request finished!')
             output = request_data["output"]
+            runner_queue.remove_request(request_uuid)
             break
         time.sleep(0.1)
 

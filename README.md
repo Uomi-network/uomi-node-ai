@@ -101,6 +101,12 @@ The service is configured for optimal performance with:
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## 🧑‍💻 Testing
+
+To run tests, execute the following command:
+```bash
+python -m unittest discover -s tests -p "*_test.py"
+```
 
 ## ⚠️ Troubleshooting
 

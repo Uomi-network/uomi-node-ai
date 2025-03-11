@@ -149,9 +149,7 @@ class TransformersModelManager:
         
         Args:
             prompts: Input prompts for the model
-        
-        Returns:
-            The model's outputs
+            on_prompt_finished: Callback function to call when a prompt is finished
         """
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
@@ -200,10 +198,9 @@ class TransformersModelManager:
 
         # Create tracking for prompt lengths
         prompt_lengths = [ids.shape[1] for ids in all_input_ids]
-        max_prompt_length = max(prompt_lengths)
 
         # Pre-allocate tensors with enough space for full sequence (prompt + all output tokens)
-        full_sequence_length = max_prompt_length + TRANSFORMERS_INFERENCE_MAX_TOKENS + 10
+        full_sequence_length = max(prompt_lengths) + TRANSFORMERS_INFERENCE_MAX_TOKENS + 10
 
         # Create padded input tensors with attention masks
         batched_input_ids = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
@@ -226,7 +223,7 @@ class TransformersModelManager:
 
         # Process tokens step by step
         for step in range(TRANSFORMERS_INFERENCE_MAX_TOKENS):
-            print(f"Step {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
+            print(f"Step execution {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
             if not active_batch_indices:
                 break  # All inferences have completed
             # Get active batch
@@ -267,18 +264,165 @@ class TransformersModelManager:
                 current_positions[original_idx] += 1
                 
                 # Store the token on all_output_tokens
-                all_output_tokens[original_idx].append([selected_token_id, top_tokens[selected_token_id]["index"]])
+                all_output_tokens[original_idx].append({
+                    "id": selected_token_id,
+                    "prob": top_tokens[selected_token_id]["prob"],
+                    "index": top_tokens[selected_token_id]["index"],
+                })
                 # Check if the generated token is the </s> token
                 if selected_token_id == eos_token_id:
                     completed_sequences[original_idx] = True
                 # Only keep sequences that haven't generated </s> in the active batch
                 if completed_sequences[original_idx]:
                     prompt_text = tokenizer.decode(all_input_ids[original_idx].squeeze(0).tolist(), skip_special_tokens=True)
-                    string = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
-                    string = string[len(prompt_text):]
+                    response = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
+                    response = response[len(prompt_text):]
+                    
                     output = {
-                        "string": string,
-                        "tokens": all_output_tokens[original_idx],
+                        "response": response,
+                        "proof": {
+                            "tokens": all_output_tokens[original_idx],
+                            "full_sequence_length": full_sequence_length
+                        }
+                    }
+                    on_prompt_finished(original_idx, output)
+                else:
+                    new_active_batch_indices.append(original_idx)
+            # Update active batch indices
+            active_batch_indices = new_active_batch_indices
+
+    def run_batch_checks(self, prompts, proofs, on_prompt_finished):
+        """
+        Run inference on the current GPU model on a batch of prompts with proofs being sure proofs are valid.
+        
+        Args:
+            prompts: Input prompts for the model
+            proofs: Proofs to check while executing the prompts
+            on_prompt_finished: Callback function to call when a prompt is finished
+        """
+        if self.current_gpu_model is None:
+            print("No model loaded on GPU")
+            return None
+        start_time = time.time()
+
+        # Switch between deterministic and non-deterministic behavior
+        if self.models_config[self.current_gpu_model_name].deterministic:
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True)
+        else:
+            torch.manual_seed(self.seed)
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+            torch.use_deterministic_algorithms(False)
+        
+        # Convert prompts to texts
+        tokenizer = self.tokenizers[self.current_gpu_model_name]
+        texts = []
+        for prompt in prompts:
+            text = tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            texts.append(text)
+
+        # Convert texts to tensors
+        all_input_ids = []
+        for text in texts:
+            input_ids = tokenizer.encode(
+                text,
+                return_tensors="pt"
+            ).to("cuda")
+            all_input_ids.append(input_ids)
+        
+        # Initialize tracking variables for each sequence in the batch
+        batch_size = len(prompts)
+        all_output_tokens = [[] for _ in range(batch_size)]
+        first_new_token_ids = [None for _ in range(batch_size)]
+        active_batch_indices = list(range(batch_size))
+
+        # Create tracking for prompt lengths
+        prompt_lengths = [ids.shape[1] for ids in all_input_ids]
+
+        # Pre-allocate tensors with enough space for full sequence (take from the longest proof instead of max tokens)
+        full_sequence_length = max(proof["full_sequence_length"] for proof in proofs)
+
+        # Create padded input tensors with attention masks
+        batched_input_ids = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
+        batched_attention_masks = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
+
+        # Fill in the prompt portions
+        for i, input_ids in enumerate(all_input_ids):
+            seq_len = input_ids.shape[1]
+            batched_input_ids[i, :seq_len] = input_ids.squeeze(0)
+            batched_attention_masks[i, :seq_len] = 1
+
+        # Track current token position for each sequence (starts at end of prompt)
+        current_positions = prompt_lengths.copy()
+
+        # Get the ID for the </s> token
+        eos_token_id = tokenizer.eos_token_id
+
+        # Track which sequences have completed (generated </s>)
+        completed_sequences = [False] * batch_size
+
+        # Process tokens step by step
+        for step in range(TRANSFORMERS_INFERENCE_MAX_TOKENS):
+            print(f"Step check {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
+            if not active_batch_indices:
+                break  # All inferences have completed
+            # Get active batch
+            active_input_ids = batched_input_ids[active_batch_indices]
+            active_attention_masks = batched_attention_masks[active_batch_indices]
+            # Forward pass on the active batch
+            outputs = self.current_gpu_model(input_ids=active_input_ids, attention_mask=active_attention_masks)
+            # Process each active inference
+            new_active_batch_indices = []
+            for batch_pos, original_idx in enumerate(active_batch_indices):
+                proof = proofs[original_idx]
+                current_token_id = proof["tokens"][step]["id"]
+                # Get the position of the last token in this sequence
+                last_pos = current_positions[original_idx] - 1
+                next_token_logits = outputs.logits[batch_pos, last_pos, :].unsqueeze(0)
+                # Apply temperature (if not 1.0)
+                if TRANSFORMERS_INFERENCE_TEMPERATURE != 1.0:
+                    next_token_logits = next_token_logits / TRANSFORMERS_INFERENCE_TEMPERATURE
+                # Convert to probabilities
+                probs = F.softmax(next_token_logits, dim=-1)
+                # Get top-k tokens by probability
+                top_probs, top_indices = probs.topk(10, dim=-1)
+                # Be sure current token is in top-k
+                if current_token_id not in top_indices:
+                    completed_sequences[original_idx] = True
+                    on_prompt_finished(original_idx, { "response": "", "proof": None })
+                    continue
+
+                # Sample forced to the current token
+                selected_token_id = current_token_id
+                # Record the first token if this is the first step
+                if step == 0:
+                    first_new_token_ids[original_idx] = selected_token_id
+                # Add the selected token to the input sequence for next iteration
+                pos = current_positions[original_idx]
+                batched_input_ids[original_idx, pos] = selected_token_id
+                batched_attention_masks[original_idx, pos] = 1
+                current_positions[original_idx] += 1
+                # Check if the generated token is the </s> token
+                if selected_token_id == eos_token_id:
+                    completed_sequences[original_idx] = True
+                # Only keep sequences that haven't generated </s> in the active batch
+                if completed_sequences[original_idx]:
+                    prompt_text = tokenizer.decode(all_input_ids[original_idx].squeeze(0).tolist(), skip_special_tokens=True)
+                    response = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
+                    response = response[len(prompt_text):]
+                    
+                    output = {
+                        "response": response,
+                        "proof": None
                     }
                     on_prompt_finished(original_idx, output)
                 else:
@@ -327,30 +471,30 @@ TRANSFORMERS_MODEL_CONFIG = {
             'max_new_tokens': 8196,
         }
     ),
-    # 'casperhansen/deepseek-r1-distill-qwen-14b-awq': TransformersModelConfig(
-    #     model_name='casperhansen/deepseek-r1-distill-qwen-14b-awq',
-    #     deterministic=False,
-    #     location="cpu",
-    #     model_kwargs={},
-    #     tokenizer_kwargs={},
-    #     inference_kwargs={
-    #         'do_sample': True,
-    #         'temperature': 0.7,
-    #         'top_p': 0.9,
-    #         'max_new_tokens': 8196,
-    #     }
-    # ),
-    # 'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
-    #     model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
-    #     deterministic=False,
-    #     location="disk",
-    #     model_kwargs={},
-    #     tokenizer_kwargs={},
-    #     inference_kwargs={
-    #         'do_sample': True,
-    #         'temperature': 0.7,
-    #         'top_p': 0.9,
-    #         'max_new_tokens': 8196,
-    #     }
-    # ),
+    'casperhansen/deepseek-r1-distill-qwen-14b-awq': TransformersModelConfig(
+        model_name='casperhansen/deepseek-r1-distill-qwen-14b-awq',
+        deterministic=False,
+        location="cpu",
+        model_kwargs={},
+        tokenizer_kwargs={},
+        inference_kwargs={
+            'do_sample': True,
+            'temperature': 0.7,
+            'top_p': 0.9,
+            'max_new_tokens': 8196,
+        }
+    ),
+    'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
+        model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
+        deterministic=False,
+        location="disk",
+        model_kwargs={},
+        tokenizer_kwargs={},
+        inference_kwargs={
+            'do_sample': True,
+            'temperature': 0.7,
+            'top_p': 0.9,
+            'max_new_tokens': 8196,
+        }
+    ),
 }
