@@ -6,6 +6,9 @@ import numpy as np
 import time
 import os
 import json
+import psutil
+import datetime
+import gc
 
 # INITIALIZER
 ##############################################################################################
@@ -15,6 +18,10 @@ UOMI_ENGINE_PALLET_VERSION = 2
 models_available = [
   "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
 ]
+
+request_history = []
+max_history_size = 100  
+service_start_time = datetime.datetime.now()
 
 # Detect if system is valid
 print("🕦 Checking system...")
@@ -104,12 +111,101 @@ def status_json():
     }
   })
 
+# MONITORING API
+##############################################################################################
+
+@app.route('/monitoring', methods=['GET'])
+def monitoring_json():
+    # Statistiche di sistema
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    memory_info = psutil.virtual_memory()
+    disk_info = psutil.disk_usage('/')
+    
+    # Statistiche CUDA
+    cuda_stats = {}
+    if cuda_available:
+        try:
+            cuda_stats = {
+                "device_count": torch.cuda.device_count(),
+                "current_device": torch.cuda.current_device(),
+                "devices": []
+            }
+            
+            for i in range(torch.cuda.device_count()):
+                device_stats = {
+                    "name": torch.cuda.get_device_name(i),
+                    "memory_allocated": torch.cuda.memory_allocated(i) / (1024**3),  # GB
+                    "memory_reserved": torch.cuda.memory_reserved(i) / (1024**3),    # GB
+                    "max_memory_allocated": torch.cuda.max_memory_allocated(i) / (1024**3),  # GB
+                }
+                cuda_stats["devices"].append(device_stats)
+        except Exception as e:
+            cuda_stats["error"] = str(e)
+    
+    # Statistiche del modello
+    model_stats = {}
+    if model_qwen is not None:
+        try:
+            model_stats = {
+                "model_name": "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
+                "device": str(next(model_qwen.parameters()).device),
+                "param_count": sum(p.numel() for p in model_qwen.parameters()) / 1_000_000,  # milioni
+            }
+        except Exception as e:
+            model_stats["error"] = str(e)
+    
+    # Statistiche del servizio
+    uptime = datetime.datetime.now() - service_start_time
+    uptime_seconds = uptime.total_seconds()
+    
+    # Statistiche delle richieste
+    request_stats = {
+        "total_requests": len(request_history),
+        "average_request_time": sum(req["time_taken"] for req in request_history) / len(request_history) if request_history else 0,
+        "average_tokens_per_second": sum(req["tokens_per_second"] for req in request_history) / len(request_history) if request_history else 0,
+        "total_tokens_generated": sum(req["total_tokens_generated"] for req in request_history),
+        "recent_requests": request_history[-10:] if request_history else []  # Ultime 10 richieste
+    }
+    
+    # Esegui la garbage collection per garantire che le statistiche siano accurate
+    collected = gc.collect()
+    
+    return jsonify({
+        "timestamp": datetime.datetime.now().isoformat(),
+        "uptime": {
+            "days": uptime.days,
+            "hours": uptime.seconds // 3600,
+            "minutes": (uptime.seconds % 3600) // 60,
+            "seconds": uptime.seconds % 60,
+            "total_seconds": uptime_seconds
+        },
+        "system": {
+            "cpu_percent": cpu_percent,
+            "memory": {
+                "total_gb": memory_info.total / (1024**3),
+                "available_gb": memory_info.available / (1024**3),
+                "used_gb": memory_info.used / (1024**3),
+                "percent": memory_info.percent
+            },
+            "disk": {
+                "total_gb": disk_info.total / (1024**3),
+                "used_gb": disk_info.used / (1024**3),
+                "free_gb": disk_info.free / (1024**3),
+                "percent": disk_info.percent
+            }
+        },
+        "cuda": cuda_stats,
+        "model": model_stats,
+        "requests": request_stats,
+        "gc_collected": collected
+    })
+
 # RUN API
 ##############################################################################################
 
 @app.route('/run', methods=['POST'])
 def run_json():
-  global request_running  
+  global request_running, request_history
   try:
     print("Received request...")
     data = request.get_json()
@@ -218,6 +314,20 @@ def run_json():
       return jsonify({"error": "model parameter is not supported yet"}), 400
     
     # Return the response
+    if response is not None:
+            request_info = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "model": data["model"],
+                "time_taken": time_taken,
+                "total_tokens_generated": total_tokens_generated,
+                "tokens_per_second": tokens_per_second
+            }
+            request_history.append(request_info)
+            
+            # Limita la dimensione della cronologia
+            if len(request_history) > max_history_size:
+                request_history = request_history[-max_history_size:]
+        
     return jsonify({"response": response, "time_taken": time_taken, "total_tokens_generated": total_tokens_generated, "tokens_per_second": tokens_per_second})
   except Exception as e:
     print("Error:", str(e))
