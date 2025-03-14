@@ -14,7 +14,7 @@ class AbstractExecutor:
             "error": message
         }
 
-    def _generate_output(self, response, proof=None):
+    def _generate_output(self, response, proof=""):
         return {
             "result": True,
             "response": response,
