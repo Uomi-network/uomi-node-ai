@@ -112,7 +112,7 @@ class ChatExecutor(AbstractExecutor):
 
         # Run valid inputs
         def on_valid_input_finished(index, output):
-            on_input_finished(valid_inputs[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else None))
+            on_input_finished(valid_inputs[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
         model_manager.run_batch_executions([input["messages"] for input in valid_inputs], on_valid_input_finished)
 
     def check(self, inputs, proofs, model_manager, on_input_finished):
@@ -135,7 +135,7 @@ class ChatExecutor(AbstractExecutor):
 
         # Run valid inputs
         def on_valid_input_finished(index, output):
-            on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else None))
+            on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
         model_manager.run_batch_checks([input["messages"] for input in valid_inputs_with_tokens], [input["proof"] for input in valid_inputs_with_tokens], on_valid_input_finished)
 
 class ImageExecutor(AbstractExecutor):
