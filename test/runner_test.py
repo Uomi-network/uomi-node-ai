@@ -115,7 +115,7 @@ class TestRunner(unittest.TestCase):
         self.assertTrue("response" in request_data["output"])
         self.assertTrue("proof" in request_data["output"])
         self.assertTrue(isinstance(request_data["output"]["response"], str))
-        self.assertTrue(request_data["output"]["proof"] is None)
+        self.assertTrue(request_data["output"]["proof"] == '')
         self.assertTrue(len(request_data["batch"]) == 1)
 
         runner_executor.stop()
@@ -209,7 +209,7 @@ class TestRunner(unittest.TestCase):
         self.assertTrue("response" in request2_data["output"])
         self.assertTrue("proof" in request2_data["output"])
         self.assertTrue(isinstance(request2_data["output"]["response"], str))
-        self.assertTrue(request2_data["output"]["proof"] is None)
+        self.assertTrue(request2_data["output"]["proof"] == '')
         self.assertTrue(len(request2_data["batch"]) == 1)
 
         runner_executor.stop()
