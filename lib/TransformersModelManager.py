@@ -471,8 +471,8 @@ TRANSFORMERS_MODEL_CONFIG = {
             'max_new_tokens': 8196,
         }
     ),
-    'casperhansen/deepseek-r1-distill-qwen-14b-awq': TransformersModelConfig(
-        model_name='casperhansen/deepseek-r1-distill-qwen-14b-awq',
+    'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
+        model_name='Qwen/QwQ-32B-AWQ',
         deterministic=False,
         location="cpu",
         model_kwargs={},
