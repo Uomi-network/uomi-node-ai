@@ -242,11 +242,19 @@ class TransformersModelManager:
                     next_token_logits = next_token_logits / TRANSFORMERS_INFERENCE_TEMPERATURE
                 # Convert to probabilities
                 probs = F.softmax(next_token_logits, dim=-1)
+                # Filter out tokens with probability <= 10^-4
+                min_p_threshold = 1e-4
+                valid_probs_mask = probs > min_p_threshold
+                filtered_probs = probs.clone()
+                filtered_probs[~valid_probs_mask] = 0.0
+                # Renormalize probabilities after filtering
+                if filtered_probs.sum() > 0:
+                    filtered_probs = filtered_probs / filtered_probs.sum()
                 # Get top-k tokens by probability
-                top_probs, top_indices = probs.topk(5, dim=-1)
+                top_probs, top_indices = filtered_probs.topk(5, dim=-1)
                 top_tokens = {}
                 for i, idx in enumerate(top_indices[0]):
-                    prob = probs[0, idx].item()
+                    prob = filtered_probs[0, idx].item()
                     top_tokens[idx.item()] = {
                         "prob": prob,
                         "index": i
