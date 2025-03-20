@@ -21,8 +21,20 @@ This repository contains the necessary components to set up and run the AI servi
 - Ubuntu/Debian-based system
 - Conda package manager
 - Systemd (for service management)
-- Minimum 32GB RAM recommended
+- Minimum 64GB RAM recommended
 - CUDA Toolkit 11.x or higher
+
+## Nvidia Driver Installation
+
+```bash
+sudo apt-get purge nvidia-*
+sudo apt-get update
+sudo apt-get autoremove
+sudo apt install libnvidia-common-530
+sudo apt install nvidia-driver-530
+# Reboot
+nvidia-smi
+```
 
 ## 🛠️ Installation
 
