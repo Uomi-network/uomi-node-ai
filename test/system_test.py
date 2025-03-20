@@ -1,6 +1,6 @@
 import os
 import unittest
-from lib.system_tmp import System
+from lib.system import System
 from lib.config import MODELS_FOLDER
 
 class TestSystem(unittest.TestCase):
