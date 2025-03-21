@@ -11,7 +11,6 @@ class SanaModelConfig:
     model_name: str  # HuggingFace model name/path
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
-    inference_kwargs: Dict[str, Any]  # Additional kwargs for inference
 
 class SanaModelManager:
     def __init__(self, models_config: Dict[str, SanaModelConfig]):
@@ -131,7 +130,6 @@ SANA_MODEL_CONFIG = {
     'Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers': SanaModelConfig(
         model_name='Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers',
         model_kwargs={},
-        tokenizer_kwargs={},
-        inference_kwargs={}
+        tokenizer_kwargs={}
     ),
 }

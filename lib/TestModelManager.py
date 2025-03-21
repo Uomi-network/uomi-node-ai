@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE
 
 @dataclass
 class TestModelConfig:

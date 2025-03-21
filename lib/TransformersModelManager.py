@@ -14,7 +14,6 @@ class TransformersModelConfig:
     location: str  # Location of the model (cpu, disk)
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
-    inference_kwargs: Dict[str, Any]  # Additional kwargs for inference
 
 class TransformersModelManager:
     def __init__(self, models_config: Dict[str, TransformersModelConfig]):
@@ -470,39 +469,20 @@ TRANSFORMERS_MODEL_CONFIG = {
         deterministic=True,
         location="cpu",
         model_kwargs={},
-        tokenizer_kwargs={},
-        inference_kwargs={
-            'do_sample': False,
-            'num_beams': 1,
-            'temperature': 1.0,
-            'top_p': 1.0,
-            'max_new_tokens': 8196,
-        }
+        tokenizer_kwargs={}
     ),
     'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
         model_name='Qwen/QwQ-32B-AWQ',
         deterministic=False,
         location="cpu",
         model_kwargs={},
-        tokenizer_kwargs={},
-        inference_kwargs={
-            'do_sample': True,
-            'temperature': 0.7,
-            'top_p': 0.9,
-            'max_new_tokens': 8196,
-        }
+        tokenizer_kwargs={}
     ),
     'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
         model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
         deterministic=False,
         location="disk",
         model_kwargs={},
-        tokenizer_kwargs={},
-        inference_kwargs={
-            'do_sample': True,
-            'temperature': 0.7,
-            'top_p': 0.9,
-            'max_new_tokens': 8196,
-        }
+        tokenizer_kwargs={}
     ),
 }
