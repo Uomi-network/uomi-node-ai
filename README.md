@@ -80,7 +80,7 @@ The service exposes an HTTP endpoint at `http://localhost:8888/run` accepting PO
 
 ```json
 {
-  "model": "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
+  "model": "casperhansen/mistral-small-24b-instruct-2501-awq",
   "input": {
     "messages": [
       {
