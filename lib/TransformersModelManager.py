@@ -468,21 +468,27 @@ TRANSFORMERS_MODEL_CONFIG = {
         model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
         deterministic=True,
         location="cpu",
-        model_kwargs={},
+        model_kwargs={
+            "use_cache": True
+        },
         tokenizer_kwargs={}
     ),
     'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
         model_name='Qwen/QwQ-32B-AWQ',
         deterministic=False,
         location="cpu",
-        model_kwargs={},
+        model_kwargs={
+            "use_cache": True
+        },
         tokenizer_kwargs={}
     ),
     'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
         model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
         deterministic=False,
         location="disk",
-        model_kwargs={},
+        model_kwargs={
+            "use_cache": True
+        },
         tokenizer_kwargs={}
     ),
 }
