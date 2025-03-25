@@ -39,7 +39,7 @@ class System:
                 # Count GPUs with 24GB+ VRAM
                 valid_gpus = sum(1 for gpu in gpus if float(gpu) >= 24000)  # VRAM in MiB
                 print(f"Valid GPUs: {valid_gpus}")
-                if valid_gpus < 2:
+                if valid_gpus < 1:
                     print("🚨 Insufficient GPUs")
                     return False
             except (subprocess.CalledProcessError, FileNotFoundError):
