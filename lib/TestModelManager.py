@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE
 
 @dataclass
 class TestModelConfig:
@@ -41,7 +42,7 @@ class TestModelManager:
             self.current_gpu_model = None
             self.current_gpu_model_name = None
 
-        print(f"Time taken to clear model: {time.time() - time_start:.2f}s")
+        print(f"Time taken to clear model for TEST MODEL MANAGER: {time.time() - time_start:.2f}s")
 
     def run_batch_executions(self, prompts, on_prompt_finished):
         if self.current_gpu_model is None:

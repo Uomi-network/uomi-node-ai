@@ -11,6 +11,7 @@ class SanaModelConfig:
     model_name: str  # HuggingFace model name/path
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
+    inference_kwargs: Dict[str, Any]  # Additional kwargs for inference
 
 class SanaModelManager:
     def __init__(self, models_config: Dict[str, SanaModelConfig]):
@@ -35,6 +36,10 @@ class SanaModelManager:
             )
 
             self.cpu_models[model_name] = model
+
+            # Try a switch
+            self.switch_model(model_name)
+            self.clear_model()
     
     def switch_model(self, model_name: str):
         """
@@ -57,9 +62,9 @@ class SanaModelManager:
         self.clear_model()
         
         # Move new model to GPU
-        self.current_gpu_model = self.cpu_models[model_name].to("cuda", non_blocking=True)
-        self.current_gpu_model.vae.to("cuda", dtype=torch.bfloat16, non_blocking=True)
-        self.current_gpu_model.text_encoder.to("cuda", dtype=torch.bfloat16, non_blocking=True)
+        self.current_gpu_model = self.cpu_models[model_name].to("cuda")
+        self.current_gpu_model.vae.to("cuda", dtype=torch.bfloat16)
+        self.current_gpu_model.text_encoder.to("cuda", dtype=torch.bfloat16)
         self.current_gpu_model_name = model_name
 
         torch.cuda.synchronize()  # Synchronize CUDA operations
@@ -74,9 +79,9 @@ class SanaModelManager:
         time_start = time.time()
         if self.current_gpu_model is not None:
             # Move model back to CPU
-            self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu", non_blocking=True)
-            self.cpu_models[self.current_gpu_model_name].vae.to("cpu", non_blocking=True)
-            self.cpu_models[self.current_gpu_model_name].text_encoder.to("cpu", non_blocking=True)
+            self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu")
+            self.cpu_models[self.current_gpu_model_name].vae.to("cpu")
+            self.cpu_models[self.current_gpu_model_name].text_encoder.to("cpu")
 
             # Clear GPU model references
             self.current_gpu_model = None
@@ -88,7 +93,7 @@ class SanaModelManager:
             # Ensure all CUDA operations are finished
             torch.cuda.synchronize()
 
-        print(f"Time taken to clear model: {time.time() - time_start:.2f}s")
+        print(f"Time taken to clear model for SANA MODEL MANAGER: {time.time() - time_start:.2f}s")
 
     def run_inference(self, prompt):
         """
@@ -127,9 +132,10 @@ class SanaModelManager:
         return self.current_gpu_model
 
 SANA_MODEL_CONFIG = {
-    'Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers': SanaModelConfig(
-        model_name='Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers',
-        model_kwargs={},
-        tokenizer_kwargs={}
-    ),
+    # 'Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers': SanaModelConfig(
+    #     model_name='Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers',
+    #     model_kwargs={},
+    #     tokenizer_kwargs={},
+    #     inference_kwargs={}
+    # ),
 }

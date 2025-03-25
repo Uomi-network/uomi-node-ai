@@ -52,11 +52,14 @@ class TransformersModelManager:
                 )
                 # Pin memory for faster GPU transfer
                 for param in model.parameters():
-                    param.data = param.data.pin_memory()
+                    param.data.pin_memory()
                 for buffer in model.buffers():
-                    buffer.data = buffer.data.pin_memory()
+                    buffer.data.pin_memory()
 
+                # Try a switch
                 self.cpu_models[model_name] = model
+                self.switch_model(model_name)
+                self.clear_model()
             
             # Load model from disk to gpu, then clear it
             elif config.location == "disk":
@@ -97,7 +100,7 @@ class TransformersModelManager:
         
         # Move new model to GPU from CPU
         if model_config.location == "cpu":
-            self.current_gpu_model = self.cpu_models[model_name].to("cuda", non_blocking=True)
+            self.current_gpu_model = self.cpu_models[model_name].to("cuda")
             self.current_gpu_model_name = model_name
 
             torch.cuda.synchronize()  # Synchronize CUDA operations
@@ -128,7 +131,7 @@ class TransformersModelManager:
         if self.current_gpu_model is not None:
             if self.models_config[self.current_gpu_model_name].location == "cpu":
                 # Move model back to CPU
-                self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu", non_blocking=True)
+                self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu")
 
             # Clear GPU model references
             self.current_gpu_model = None
@@ -140,7 +143,7 @@ class TransformersModelManager:
             # Ensure all CUDA operations are finished
             torch.cuda.synchronize()
 
-        print(f"Time taken to clear model: {time.time() - time_start:.2f}s")
+        print(f"Time taken to clear model for TRANSFORMERS MODEL MANAGER: {time.time() - time_start:.2f}s")
 
     def run_batch_executions(self, prompts, on_prompt_finished):
         """
