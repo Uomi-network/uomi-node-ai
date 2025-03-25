@@ -1,4 +1,11 @@
-conda env remove -n uomi-ai # If environment already exists
+#!/bin/bash
+# Check if environment exists before removing
+if conda info --envs | grep -q "uomi-ai"; then
+    echo "Removing existing uomi-ai environment..."
+    conda env remove -n uomi-ai
+else
+    echo "Environment uomi-ai does not exist, skipping removal..."
+fi
 conda create -n uomi-ai python=3.10 -y
 conda activate uomi-ai
 conda install pytorch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 pytorch-cuda=12.1 -c pytorch -c nvidia
