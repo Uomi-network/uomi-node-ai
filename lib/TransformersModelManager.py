@@ -5,6 +5,9 @@ from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
+from transformers import LogitsProcessor
+import torch
+import time
 
 from transformers import (
     TemperatureLogitsWarper,
@@ -47,6 +50,7 @@ class TransformersModelManager:
         self.current_gpu_model = None
         self.current_gpu_model_name = None
         self.seed = 42  # Seed for deterministic behavior
+        self.device = 'cuda'
 
         self.warpers = [
             TemperatureLogitsWarper(TRANSFORMERS_INFERENCE_TEMPERATURE),
@@ -68,6 +72,7 @@ class TransformersModelManager:
                 print(f"Loading model {model_name} on CPU")
                 model = AutoModelForCausalLM.from_pretrained(
                     config.model_name,
+                    # attn_implementation="flash_attention_2",
                     device_map="cpu",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
                     cache_dir=MODELS_FOLDER,
@@ -91,6 +96,7 @@ class TransformersModelManager:
                 self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                     config.model_name,
                     device_map="cuda",
+                    # attn_implementation="flash_attention_2",
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
                     cache_dir=MODELS_FOLDER,
                     **config.model_kwargs
@@ -135,6 +141,7 @@ class TransformersModelManager:
                 device_map="cuda",
                 torch_dtype=torch.float16,  # Use float16 for memory efficiency
                 cache_dir=MODELS_FOLDER,
+                # attn_implementation="flash_attention_2",
                 **model_config.model_kwargs
             )
             self.current_gpu_model_name = model_name
@@ -170,7 +177,7 @@ class TransformersModelManager:
 
     def run_batch_executions(self, prompts, on_prompt_finished):
         """
-        Run inference on the current GPU model on a batch of prompts.
+        Run inference on the current GPU model on a batch of prompts using the generate() method.
         
         Args:
             prompts: Input prompts for the model
@@ -179,7 +186,7 @@ class TransformersModelManager:
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
             return None 
-       
+    
         start_time = time.time()
 
         # Switch between deterministic and non-deterministic behavior
@@ -198,6 +205,12 @@ class TransformersModelManager:
         
         # Convert prompts to texts
         tokenizer = self.tokenizers[self.current_gpu_model_name]
+        
+        # Ensure tokenizer has padding token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Convert prompts to chat templates
         texts = []
         for prompt in prompts:
             text = tokenizer.apply_chat_template(
@@ -207,527 +220,205 @@ class TransformersModelManager:
             )
             texts.append(text)
 
-        # Convert texts to tensors
-        all_input_ids = []
-        for text in texts:
-            input_ids = tokenizer.encode(
-                text,
-                return_tensors="pt"
-            ).to("cuda")
-            all_input_ids.append(input_ids)
-        
-        # Initialize tracking variables for each sequence in the batch
-        batch_size = len(prompts)
-        all_output_tokens = [[] for _ in range(batch_size)]
-        first_new_token_ids = [None for _ in range(batch_size)]
-        active_batch_indices = list(range(batch_size))
-
-        # Create tracking for prompt lengths
-        prompt_lengths = [ids.shape[1] for ids in all_input_ids]
-
-        # Pre-allocate tensors with enough space for full sequence (prompt + all output tokens)
-        full_sequence_length = max(prompt_lengths) + TRANSFORMERS_INFERENCE_MAX_TOKENS + 10
-
-        # Create padded input tensors with attention masks
-        batched_input_ids = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
-        batched_attention_masks = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
-
-        # Fill in the prompt portions
-        for i, input_ids in enumerate(all_input_ids):
-            seq_len = input_ids.shape[1]
-            batched_input_ids[i, :seq_len] = input_ids.squeeze(0)
-            batched_attention_masks[i, :seq_len] = 1
-
-        # Track current token position for each sequence (starts at end of prompt)
-        current_positions = prompt_lengths.copy()
-
-        # Get the ID for the </s> token
-        eos_token_id = tokenizer.eos_token_id
-
-        # Track which sequences have completed (generated </s>)
-        completed_sequences = [False] * batch_size
-
-        # Initialize past_key_values for KV caching
-        past = None
-
-        choice = Sampling(self.seed, 'cuda')
-        
-        for step in range(TRANSFORMERS_INFERENCE_MAX_TOKENS):
-            print(f"Step execution {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
-            if not active_batch_indices:
-                break  # All inferences have completed
+        # Ensure tokenizer has padding token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
             
-            if not USE_KV_CACHE:
-                # NON-CACHING APPROACH: Process full sequences with dynamic batch sizing
-                
-                # Optimize sequence processing by only processing active sequences up to their current lengths
-                active_sequences = [batched_input_ids[idx, :current_positions[idx]] for idx in active_batch_indices]
-                
-                # Find maximum sequence length in the current batch
-                max_len = max(seq.size(0) for seq in active_sequences)
-                
-                # Create efficiently sized tensors for this step
-                padded_sequences = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                active_attention_masks = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                
-                # Fill in the padded tensors with actual sequence data
-                for i, seq in enumerate(active_sequences):
-                    seq_len = seq.size(0)
-                    padded_sequences[i, :seq_len] = seq
-                    active_attention_masks[i, :seq_len] = 1
-                
-                # Forward pass with optimally sized inputs
-                outputs = self.current_gpu_model(
-                    input_ids=padded_sequences,
-                    attention_mask=active_attention_masks,
-                    use_cache=False  # Explicitly disable KV caching
-                )
-                
-                # Extract logits at the end of each sequence
-                batch_indices = torch.arange(len(active_sequences))
-                seq_lengths = torch.tensor([seq.size(0) - 1 for seq in active_sequences])
-                next_token_logits = outputs.logits[batch_indices, seq_lengths]
-                
-            else:
-                # KV CACHING APPROACH: Only process the new token each time
-                if step == 0:
-                    # First step: process full prompt
-                    active_sequences = [batched_input_ids[idx, :current_positions[idx]] for idx in active_batch_indices]
+        # Tokenize all inputs
+        batch_input_ids = tokenizer(texts, padding=True, return_tensors="pt").input_ids.to(self.device)
+        
+        # Setup generation parameters
+        generation_config = {
+            "max_new_tokens": TRANSFORMERS_INFERENCE_MAX_TOKENS,
+            "temperature": TRANSFORMERS_INFERENCE_TEMPERATURE,
+            "do_sample": not self.models_config[self.current_gpu_model_name].deterministic,
+            "use_cache": USE_KV_CACHE,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+        }
+        
+        # Apply any warper-specific configurations
+        for warper in self.warpers:
+            # Adjust generation config based on warper type
+            if hasattr(warper, "top_k") and warper.top_k is not None:
+                generation_config["top_k"] = warper.top_k
+            if hasattr(warper, "top_p") and warper.top_p is not None:
+                generation_config["top_p"] = warper.top_p
+            # Add other warper configurations as needed
+        
+        # Run generation
+        outputs = self.current_gpu_model.generate(
+            batch_input_ids,
+            **generation_config
+        )        
+        # Process results
+        generated_sequences = outputs.sequences
+        scores = outputs.scores
+        
+        # Process each output sequence
+        for i, (input_ids, generated_sequence) in enumerate(zip(batch_input_ids, generated_sequences)):
+            # Get the generated text (only the new tokens, not the prompt)
+            print(f"{generated_sequences=}")
+            prompt_length = len(input_ids)
+            generated_tokens = generated_sequence[prompt_length:]
+            
+            # Convert back to text
+            prompt_text = tokenizer.decode(input_ids, skip_special_tokens=True)
+            response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Extract token probabilities and prepare proof
+            all_output_tokens = []
+            
+            for token_idx, token_id in enumerate(generated_tokens):
+                # Get the score for this position
+                if token_idx < len(scores):
+                    token_scores = scores[token_idx][i]
+                    # Get probabilities
+                    token_probs = torch.nn.functional.softmax(token_scores, dim=-1)
+                    # Get top tokens
+                    top_probs, top_indices = token_probs.topk(5)
                     
-                    # Find maximum sequence length in the current batch
-                    max_len = max(seq.size(0) for seq in active_sequences)
+                    # Find this token's probability and rank
+                    token_prob = None
+                    token_rank = -1
                     
-                    # Create efficiently sized tensors for this step
-                    padded_sequences = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                    active_attention_masks = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
+                    for rank, idx in enumerate(top_indices):
+                        if idx.item() == token_id.item():
+                            token_prob = top_probs[rank].item()
+                            token_rank = rank
+                            break
                     
-                    # Fill in the padded tensors with actual sequence data
-                    for i, seq in enumerate(active_sequences):
-                        seq_len = seq.size(0)
-                        padded_sequences[i, :seq_len] = seq
-                        active_attention_masks[i, :seq_len] = 1
-                    
-                    # Forward pass on the active batch (first step)
-                    outputs = self.current_gpu_model(
-                        input_ids=padded_sequences, 
-                        attention_mask=active_attention_masks,
-                        use_cache=True  # Enable KV caching
-                    )
-                    
-                    # Extract logits at the end of each sequence
-                    batch_indices = torch.arange(len(active_sequences))
-                    seq_lengths = torch.tensor([seq.size(0) - 1 for seq in active_sequences])
-                    next_token_logits = outputs.logits[batch_indices, seq_lengths]
-                    
+                    if token_prob is None and token_id.item() < len(token_probs):
+                        token_prob = token_probs[token_id.item()].item()
                 else:
-                    # Subsequent steps: only process the last token
-                    active_input_ids = torch.stack([
-                        batched_input_ids[idx, current_positions[idx]-1:current_positions[idx]] 
-                        for idx in active_batch_indices
-                    ])
-                    
-                    # Create proper position IDs for the new tokens
-                    position_ids = torch.tensor([
-                        [current_positions[idx] - 1] for idx in active_batch_indices
-                    ], device=active_input_ids.device)
-                    
-                    # We need full attention mask when using past_key_values
-                    active_attention_masks = torch.stack([
-                        batched_attention_masks[idx, :current_positions[idx]] 
-                        for idx in active_batch_indices
-                    ])
-                    
-                    # Forward pass with past key values
-                    outputs = self.current_gpu_model(
-                        input_ids=active_input_ids,
-                        attention_mask=active_attention_masks,
-                        position_ids=position_ids,
-                        use_cache=True,
-                        past_key_values=past
-                    )
-                    
-                    # For KV caching in subsequent steps, logits are for the last token only
-                    next_token_logits = outputs.logits[:, -1]
-                
-            # Apply warpers to all logits at once
-            for warper in self.warpers:
-                next_token_logits = warper(None, next_token_logits)
-            
-            # Sample next tokens for all sequences at once
-            selected_token_ids = torch.tensor([choice(logits).item() for logits in next_token_logits])
-            
-            # Record first tokens if this is the first step
-            if step == 0:
-                for i, original_idx in enumerate(active_batch_indices):
-                    first_new_token_ids[original_idx] = selected_token_ids[i].item()
-            
-            # Get top-k tokens and probabilities for logging/proof
-            top_probs, top_indices = next_token_logits.topk(5, dim=-1)
-            
-            # Create a list to track which indices remain active after this step
-            new_active_batch_indices = []
-            new_past_indices = []
-            
-            # Update all sequences and check for completion in one pass
-            for batch_pos, original_idx in enumerate(active_batch_indices):
-                selected_token_id = selected_token_ids[batch_pos].item()
-                
-                # Add the selected token to the sequence
-                pos = current_positions[original_idx]
-                batched_input_ids[original_idx, pos] = selected_token_id
-                batched_attention_masks[original_idx, pos] = 1
-                current_positions[original_idx] += 1
-                
-                # Create top tokens dictionary for this sequence
-                sequence_top_tokens = {
-                    top_indices[batch_pos, i].item(): {
-                        "prob": top_probs[batch_pos, i].item(),
-                        "index": i
-                    } for i in range(top_indices.size(1))
-                }
+                    # For tokens beyond the available scores
+                    token_prob = 0.0
+                    token_rank = -1
                 
                 # Store token information
                 token_info = {
-                    "id": selected_token_id,
-                    "prob": sequence_top_tokens.get(selected_token_id, {"prob": 0.0, "index": -1})["prob"],
-                    "index": sequence_top_tokens.get(selected_token_id, {"prob": 0.0, "index": -1})["index"],
+                    "id": token_id.item(),
+                    "prob": token_prob,
+                    "index": token_rank
                 }
-                all_output_tokens[original_idx].append(token_info)
-                
-                # Check if the sequence is complete
-                if selected_token_id == eos_token_id:
-                    completed_sequences[original_idx] = True
-                    
-                # Process completed sequences
-                if completed_sequences[original_idx]:
-                    prompt_text = tokenizer.decode(all_input_ids[original_idx].squeeze(0).tolist(), skip_special_tokens=True)
-                    response = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
-                    response = response[len(prompt_text):]
-                    
-                    output = {
-                        "response": response,
-                        "proof": {
-                            "tokens": all_output_tokens[original_idx],
-                            "full_sequence_length": full_sequence_length
-                        }
-                    }
-                    on_prompt_finished(original_idx, output)
-                else:
-                    new_active_batch_indices.append(original_idx)
-                    new_past_indices.append(batch_pos)
+                all_output_tokens.append(token_info)
             
-            # Update past_key_values for next iteration if using KV caching
-            if USE_KV_CACHE and new_active_batch_indices and outputs.past_key_values is not None:
-                try:
-                    # For newer HuggingFace versions using Cache class
-                    from transformers.generation.utils import Cache
-                    if isinstance(outputs.past_key_values, Cache):
-                        past = outputs.past_key_values.reorder_cache(new_past_indices)
-                    else:
-                        # For tuple-based format
-                        past = tuple(
-                            tuple(p_i[new_past_indices] for p_i in layer_past)
-                            for layer_past in outputs.past_key_values
-                        )
-                except (ImportError, AttributeError):
-                    # Fallback for older versions
-                    past = tuple(
-                        tuple(p_i[new_past_indices] for p_i in layer_past)
-                        for layer_past in outputs.past_key_values
-                    )
-            elif not USE_KV_CACHE or not new_active_batch_indices:
-                past = None
+            output = {
+                "response": response,
+                "proof": {
+                    "tokens": all_output_tokens,
+                    "full_sequence_length": len(generated_sequence)
+                }
+            }
             
-            # Update active batch indices
-            active_batch_indices = new_active_batch_indices
-            
-            # Optional: Print token generation speed
-            if step > 0 and step % 10 == 0:
-                elapsed = time.time() - start_time
-                tokens_generated = sum(current_positions[idx] - prompt_lengths[idx] for idx in range(batch_size) if not completed_sequences[idx])
-                tokens_per_second = tokens_generated / elapsed if elapsed > 0 else 0
-                print(f"Generated {tokens_generated} tokens in {elapsed:.2f}s ({tokens_per_second:.2f} tokens/sec)")
-                
+            # Call the callback with the result
+            on_prompt_finished(i, output)
+        
         # Return execution time
         end_time = time.time()
-        print(f"Execution time: {end_time - start_time:.2f} seconds")
+        execution_time = end_time - start_time
+        print(f"Execution time: {execution_time:.2f} seconds")
+        
+        return execution_time
 
     def run_batch_checks(self, prompts, proofs, on_prompt_finished):
         """
-        Run inference on the current GPU model on a batch of prompts with proofs being sure proofs are valid.
-        
+        Verify that each token in the generated sequence is among the top 10 predicted tokens.
+
         Args:
-            prompts: Input prompts for the model
-            proofs: Proofs to check while executing the prompts
-            on_prompt_finished: Callback function to call when a prompt is finished
+            prompts: List of input prompts (e.g., chat messages).
+            proofs: List of proofs, each containing generated token IDs (e.g., [{"id": token_id}, ...]).
+            on_prompt_finished: Callback function to call with verification results.
         """
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
             return None
-
         start_time = time.time()
 
-        # Switch between deterministic and non-deterministic behavior
-        if self.models_config[self.current_gpu_model_name].deterministic:
-            torch.manual_seed(self.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.seed)
+        # Deterministic setup (as per your original code)
+        deterministic_config = self.models_config[self.current_gpu_model_name].deterministic
+        torch.manual_seed(self.seed)
+        if deterministic_config:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True)
         else:
-            torch.manual_seed(self.seed)
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
             torch.use_deterministic_algorithms(False)
-        
-        # Convert prompts to texts
+
+        # Access tokenizer
         tokenizer = self.tokenizers[self.current_gpu_model_name]
-        texts = []
-        for prompt in prompts:
-            text = tokenizer.apply_chat_template(
-                prompt,
-                tokenize=False,
-                add_generation_prompt=True,
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.pad_token_id
+
+        # Prepare full input sequences (prompt + proof)
+        full_input_ids = []
+        full_attention_masks = []
+        prompt_lengths = []
+        for prompt, proof in zip(prompts, proofs):
+            # Tokenize prompt with chat template
+            prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+            prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0]
+            # Extract proof token IDs
+            proof_ids = torch.tensor([t["id"] for t in proof["tokens"]], dtype=torch.long)
+            # Concatenate prompt and proof
+            full_ids = torch.cat([prompt_ids, proof_ids], dim=0)
+            full_input_ids.append(full_ids)
+            # Create attention mask (1 for all real tokens)
+            attention_mask = torch.ones_like(full_ids)
+            full_attention_masks.append(attention_mask)
+            prompt_lengths.append(len(prompt_ids))
+
+        # Pad sequences to the same length for batch processing
+        max_len = max(len(ids) for ids in full_input_ids)
+        padded_input_ids = torch.stack([
+            torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=ids.dtype)])
+            for ids in full_input_ids
+        ]).to(self.current_gpu_model.device)
+        padded_attention_masks = torch.stack([
+            torch.cat([mask, torch.zeros(max_len - len(mask), dtype=mask.dtype)])
+            for mask in full_attention_masks
+        ]).to(self.current_gpu_model.device)
+
+        # Perform a single forward pass to get all logits
+        with torch.no_grad():
+            outputs = self.current_gpu_model(
+                input_ids=padded_input_ids,
+                attention_mask=padded_attention_masks,
+                use_cache=False  # Single pass, cache not needed
             )
-            texts.append(text)
+            logits = outputs.logits  # Shape: [batch_size, max_len, vocab_size]
 
-        # Convert texts to tensors
-        all_input_ids = []
-        for text in texts:
-            input_ids = tokenizer.encode(
-                text,
-                return_tensors="pt"
-            ).to("cuda")
-            all_input_ids.append(input_ids)
-        
-        # Initialize tracking variables for each sequence in the batch
-        batch_size = len(prompts)
-        all_output_tokens = [[] for _ in range(batch_size)]
-        first_new_token_ids = [None for _ in range(batch_size)]
-        active_batch_indices = list(range(batch_size))
+        # Verify each generated token
+        for batch_idx, (prompt_len, proof) in enumerate(zip(prompt_lengths, proofs)):
+            generated_len = len(proof["tokens"])
+            valid = True
+            # Check each token in the generated sequence
+            for i in range(generated_len):
+                # Position j predicts the token at j+1
+                j = prompt_len - 1 + i
+                if j >= max_len - 1:
+                    break  # Beyond sequence length due to padding
+                current_logits = logits[batch_idx, j, :]  # Logits for next token
+                top_tokens = torch.topk(current_logits, 10).indices  # Top 10 token IDs
+                next_token = full_input_ids[batch_idx][j + 1].item()  # Actual next token
+                if next_token not in top_tokens:
+                    valid = False
+                    break
 
-        # Create tracking for prompt lengths
-        prompt_lengths = [ids.shape[1] for ids in all_input_ids]
-
-        # Pre-allocate tensors with enough space for full sequence (take from the longest proof instead of max tokens)
-        full_sequence_length = max(proof["full_sequence_length"] for proof in proofs)
-
-        # Create padded input tensors with attention masks
-        batched_input_ids = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
-        batched_attention_masks = torch.zeros((batch_size, full_sequence_length), dtype=torch.long, device="cuda")
-
-        # Fill in the prompt portions
-        for i, input_ids in enumerate(all_input_ids):
-            seq_len = input_ids.shape[1]
-            batched_input_ids[i, :seq_len] = input_ids.squeeze(0)
-            batched_attention_masks[i, :seq_len] = 1
-
-        # Track current token position for each sequence (starts at end of prompt)
-        current_positions = prompt_lengths.copy()
-
-        # Get the ID for the </s> token
-        eos_token_id = tokenizer.eos_token_id
-
-        # Track which sequences have completed (generated </s>)
-        completed_sequences = [False] * batch_size
-        
-        # Initialize past_key_values for KV caching
-        past = None
-        
-        # Process tokens step by step
-        for step in range(TRANSFORMERS_INFERENCE_MAX_TOKENS):
-            print(f"Step check {step + 1}/{TRANSFORMERS_INFERENCE_MAX_TOKENS}")
-            if not active_batch_indices:
-                break  # All inferences have completed
-            
-            if not USE_KV_CACHE:
-                # NON-CACHING APPROACH: Process full sequences with dynamic batch sizing
-                
-                # Optimize sequence processing by only processing active sequences up to their current lengths
-                active_sequences = [batched_input_ids[idx, :current_positions[idx]] for idx in active_batch_indices]
-                
-                # Find maximum sequence length in the current batch
-                max_len = max(seq.size(0) for seq in active_sequences)
-                
-                # Create efficiently sized tensors for this step
-                padded_sequences = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                active_attention_masks = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                
-                # Fill in the padded tensors with actual sequence data
-                for i, seq in enumerate(active_sequences):
-                    seq_len = seq.size(0)
-                    padded_sequences[i, :seq_len] = seq
-                    active_attention_masks[i, :seq_len] = 1
-                
-                # Forward pass with optimally sized inputs
-                outputs = self.current_gpu_model(
-                    input_ids=padded_sequences,
-                    attention_mask=active_attention_masks,
-                    use_cache=False  # Explicitly disable KV caching
-                )
-                
-                # Extract logits at the end of each sequence
-                batch_indices = torch.arange(len(active_sequences))
-                seq_lengths = torch.tensor([seq.size(0) - 1 for seq in active_sequences])
-                next_token_logits = outputs.logits[batch_indices, seq_lengths]
-                
+            # Prepare response based on verification
+            if valid:
+                # Decode the verified generated sequence
+                generated_ids = full_input_ids[batch_idx][prompt_len:prompt_len + generated_len]
+                response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                on_prompt_finished(batch_idx, {"response": response, "proof": None})
             else:
-                # KV CACHING APPROACH: Only process the new token each time
-                if step == 0:
-                    # First step: process full prompt
-                    active_sequences = [batched_input_ids[idx, :current_positions[idx]] for idx in active_batch_indices]
-                    
-                    # Find maximum sequence length in the current batch
-                    max_len = max(seq.size(0) for seq in active_sequences)
-                    
-                    # Create efficiently sized tensors for this step
-                    padded_sequences = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                    active_attention_masks = torch.zeros((len(active_sequences), max_len), dtype=torch.long, device=batched_input_ids.device)
-                    
-                    # Fill in the padded tensors with actual sequence data
-                    for i, seq in enumerate(active_sequences):
-                        seq_len = seq.size(0)
-                        padded_sequences[i, :seq_len] = seq
-                        active_attention_masks[i, :seq_len] = 1
-                    
-                    # Forward pass on the active batch (first step)
-                    outputs = self.current_gpu_model(
-                        input_ids=padded_sequences, 
-                        attention_mask=active_attention_masks,
-                        use_cache=True  # Enable KV caching
-                    )
-                    
-                    # Extract logits at the end of each sequence
-                    batch_indices = torch.arange(len(active_sequences))
-                    seq_lengths = torch.tensor([seq.size(0) - 1 for seq in active_sequences])
-                    next_token_logits = outputs.logits[batch_indices, seq_lengths]
-                    
-                else:
-                    # Subsequent steps: only process the last token
-                    active_input_ids = torch.stack([
-                        batched_input_ids[idx, current_positions[idx]-1:current_positions[idx]] 
-                        for idx in active_batch_indices
-                    ])
-                    
-                    # Create proper position IDs for the new tokens
-                    position_ids = torch.tensor([
-                        [current_positions[idx] - 1] for idx in active_batch_indices
-                    ], device=active_input_ids.device)
-                    
-                    # We need full attention mask when using past_key_values
-                    active_attention_masks = torch.stack([
-                        batched_attention_masks[idx, :current_positions[idx]] 
-                        for idx in active_batch_indices
-                    ])
-                    
-                    # Forward pass with past key values
-                    outputs = self.current_gpu_model(
-                        input_ids=active_input_ids,
-                        attention_mask=active_attention_masks,
-                        position_ids=position_ids,
-                        use_cache=True,
-                        past_key_values=past
-                    )
-                    
-                    # For KV caching in subsequent steps, logits are for the last token only
-                    next_token_logits = outputs.logits[:, -1]
-            
-            # Process each active inference
-            new_active_batch_indices = []
-            new_past_indices = []
-            
-            for batch_pos, original_idx in enumerate(active_batch_indices):
-                proof = proofs[original_idx]
-                current_token_id = proof["tokens"][step]["id"]
-                
-                # Get logits for this sequence
-                logits = next_token_logits[batch_pos].unsqueeze(0)
-                
-                # Apply temperature (if not 1.0)
-                if TRANSFORMERS_INFERENCE_TEMPERATURE != 1.0:
-                    logits = logits / TRANSFORMERS_INFERENCE_TEMPERATURE
-                    
-                # Convert to probabilities
-                probs = F.softmax(logits, dim=-1)
-                
-                # Get top-k tokens by probability
-                top_probs, top_indices = probs.topk(10, dim=-1)
-                
-                # Be sure current token is in top-k
-                if current_token_id not in top_indices:
-                    completed_sequences[original_idx] = True
-                    on_prompt_finished(original_idx, { "response": "", "proof": None })
-                    continue
+                on_prompt_finished(batch_idx, {"response": "", "proof": None})
 
-                # Sample forced to the current token
-                selected_token_id = current_token_id
-                
-                # Record the first token if this is the first step
-                if step == 0:
-                    first_new_token_ids[original_idx] = selected_token_id
-                    
-                # Add the selected token to the input sequence for next iteration
-                pos = current_positions[original_idx]
-                batched_input_ids[original_idx, pos] = selected_token_id
-                batched_attention_masks[original_idx, pos] = 1
-                current_positions[original_idx] += 1
-                
-                # Check if the generated token is the </s> token
-                if selected_token_id == eos_token_id:
-                    completed_sequences[original_idx] = True
-                    
-                # Only keep sequences that haven't generated </s> in the active batch
-                if completed_sequences[original_idx]:
-                    prompt_text = tokenizer.decode(all_input_ids[original_idx].squeeze(0).tolist(), skip_special_tokens=True)
-                    response = tokenizer.decode(batched_input_ids[original_idx, :current_positions[original_idx]].tolist(), skip_special_tokens=True)  
-                    response = response[len(prompt_text):]
-                    
-                    output = {
-                        "response": response,
-                        "proof": None
-                    }
-                    on_prompt_finished(original_idx, output)
-                else:
-                    new_active_batch_indices.append(original_idx)
-                    new_past_indices.append(batch_pos)
-                    
-            # Update past_key_values for next iteration if using KV caching
-            if USE_KV_CACHE and new_active_batch_indices and outputs.past_key_values is not None:
-                try:
-                    # For newer HuggingFace versions using Cache class
-                    from transformers.generation.utils import Cache
-                    if isinstance(outputs.past_key_values, Cache):
-                        past = outputs.past_key_values.reorder_cache(new_past_indices)
-                    else:
-                        # For tuple-based format
-                        past = tuple(
-                            tuple(p_i[new_past_indices] for p_i in layer_past)
-                            for layer_past in outputs.past_key_values
-                        )
-                except (ImportError, AttributeError):
-                    # Fallback for older versions
-                    past = tuple(
-                        tuple(p_i[new_past_indices] for p_i in layer_past)
-                        for layer_past in outputs.past_key_values
-                    )
-            elif not USE_KV_CACHE or not new_active_batch_indices:
-                past = None
-                
-            # Update active batch indices
-            active_batch_indices = new_active_batch_indices
-            
-            # Optional: Print token checking speed
-            if step > 0 and step % 10 == 0:
-                elapsed = time.time() - start_time
-                tokens_checked = sum(current_positions[idx] - prompt_lengths[idx] for idx in range(batch_size) if not completed_sequences[idx])
-                tokens_per_second = tokens_checked / elapsed if elapsed > 0 else 0
-                print(f"Checked {tokens_checked} tokens in {elapsed:.2f}s ({tokens_per_second:.2f} tokens/sec)")
+        print(f"Batch processed in {time.time() - start_time:.2f}s")
 
-        # Return execution time
-        end_time = time.time()
-        print(f"Execution time: {end_time - start_time:.2f} seconds")
-        
     def get_current_model(self):
         """
         Get the currently active GPU model.
