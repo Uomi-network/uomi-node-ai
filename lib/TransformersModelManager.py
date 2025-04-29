@@ -36,6 +36,7 @@ class TransformersModelConfig:
     location: str  # Location of the model (cpu, disk)
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
+    warmup: bool = False  # Whether to run warmup inference when loading model to GPU
 
 class TransformersModelManager:
     def __init__(self, models_config: Dict[str, TransformersModelConfig]):
@@ -91,14 +92,12 @@ class TransformersModelManager:
                 # Store model in CPU models
                 self.cpu_models[model_name] = model
                 
-                # Pin memory for faster transfers (only for parameters that support it)
+                # Pin memory for faster transfers (with simplified approach)
                 try:
                     for param in model.parameters():
-                        if param.data.is_floating_point():  # Only pin floating point tensors
-                            param.data = param.data.pin_memory()
+                        param.data = param.data.pin_memory()
                     for buffer in model.buffers():
-                        if buffer.data.is_floating_point():  # Only pin floating point tensors
-                            buffer.data = buffer.data.pin_memory()
+                        buffer.data = buffer.data.pin_memory()
                 except Exception as e:
                     print(f"Warning: Could not pin memory for model {model_name}: {e}")
 
@@ -144,13 +143,11 @@ class TransformersModelManager:
             
             with torch.cuda.stream(stream) if stream else torch.cuda.stream(self.main_stream):
                 try:
-                    # Create a new model instance on GPU by copying from CPU
-                    # We use model.to() with non_blocking=True for asynchronous transfer
+                    # Direct model transfer without deep copy for better performance
                     print(f"Moving model {model_name} to GPU...")
                     
-                    # We need to first clone state_dict to avoid modifying the CPU model
-                    self.current_gpu_model = copy.deepcopy(self.cpu_models[model_name])
-                    self.current_gpu_model = self.current_gpu_model.to(
+                    # Directly transfer model to GPU with non_blocking for async transfer
+                    self.current_gpu_model = self.cpu_models[model_name].to(
                         device="cuda", 
                         non_blocking=True
                     )
@@ -187,15 +184,16 @@ class TransformersModelManager:
             raise ValueError(f"Invalid location {model_config.location} for model {model_name}")
 
         # Run warmup inference to initialize CUDA kernels (optional)
-        with torch.no_grad():
-            try:
-                # Create a small dummy input tensor
-                dummy_input = torch.ones((1, 10), dtype=torch.long, device="cuda")
-                # Run a forward pass to initialize CUDA kernels
-                _ = self.current_gpu_model(dummy_input)
-                torch.cuda.synchronize()
-            except Exception as e:
-                print(f"Warning: Warmup inference failed: {e}")
+        if model_config.warmup:
+            with torch.no_grad():
+                try:
+                    # Create a small dummy input tensor
+                    dummy_input = torch.ones((1, 10), dtype=torch.long, device="cuda")
+                    # Run a forward pass to initialize CUDA kernels
+                    _ = self.current_gpu_model(dummy_input)
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"Warning: Warmup inference failed: {e}")
 
         print(f"Time taken to switch model: {time.time() - time_start:.2f}s")
         return self.current_gpu_model
@@ -217,15 +215,11 @@ class TransformersModelManager:
                     with torch.cuda.stream(stream) if stream else torch.cuda.stream(self.main_stream):
                         print(f"Moving model {model_name} from GPU back to CPU...")
                         
-                        # Move model back to CPU with non_blocking if possible
-                        cpu_model = self.current_gpu_model.to(
+                        # Direct model transfer back to CPU with non_blocking for performance
+                        self.cpu_models[model_name] = self.current_gpu_model.to(
                             device="cpu", 
                             non_blocking=True
                         )
-                        
-                        # We perform a deep copy to ensure the CPU model is fully independent
-                        # This prevents CUDA errors during subsequent transfers
-                        self.cpu_models[model_name] = cpu_model
                         
                         # Wait for transfer to complete
                         if stream:
@@ -625,7 +619,8 @@ TRANSFORMERS_MODEL_CONFIG = {
         model_kwargs={
             "use_cache": True
         },
-        tokenizer_kwargs={}
+        tokenizer_kwargs={},
+        warmup=True  # Enable warmup for this model since it's large
     ),
     'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
         model_name='Qwen/QwQ-32B-AWQ',
@@ -634,7 +629,8 @@ TRANSFORMERS_MODEL_CONFIG = {
         model_kwargs={
             "use_cache": True
         },
-        tokenizer_kwargs={}
+        tokenizer_kwargs={},
+        warmup=True  # Enable warmup for this large model
     ),
     'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
         model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
@@ -643,6 +639,7 @@ TRANSFORMERS_MODEL_CONFIG = {
         model_kwargs={
             "use_cache": True
         },
-        tokenizer_kwargs={}
+        tokenizer_kwargs={},
+        warmup=False  # Smaller model, warmup not as critical
     ),
 }
