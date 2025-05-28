@@ -5,10 +5,12 @@ import gc
 import psutil
 import torch
 import atexit
+import json
 from flask import Flask, request, jsonify
 from lib.config import UOMI_ENGINE_PALLET_VERSION, CACHE_ENABLED
 from lib.runner import RunnerQueue, RunnerExecutor
 from lib.system import System
+from lib.zipper import unzip_string
 from lib.monitoring import MonitoringService
 
 print(' ')
@@ -137,13 +139,21 @@ def run_json():
     }
     
     # Try to extract token information from output if available
-    if output and "result" in output:
-        # You might need to adjust this based on your actual output structure
-        if "tokens" in output:
-            request_record["total_tokens_generated"] = output.get("tokens", 0)
-            if request_time > 0:
-                request_record["tokens_per_second"] = output.get("tokens", 0) / request_time
-    
+    if output and "proof" in output:
+        try:
+          output_proof = json.loads(unzip_string(output["proof"]))
+          tokens = output_proof.get("tokens", [])
+          # You might need to adjust this based on your actual output structure
+          if tokens:
+              request_record["tokens_per_second"] = len(tokens) / request_time
+              request_record["total_tokens_generated"] = len(tokens)
+          else:
+              request_record["tokens_per_second"] = 0
+              request_record["total_tokens_generated"] = 0
+        except Exception as e:
+            print(f'❌ Error extracting token information: {e}')
+            request_record["tokens_per_second"] = 0
+            request_record["total_tokens_generated"] = 0
     request_history.append(request_record)
     
     # Keep only the last 100 requests in history
