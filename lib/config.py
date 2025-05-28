@@ -16,5 +16,5 @@ TRANSFORMERS_INFERENCE_TEMPERATURE = 0.6
 # KV Cache
 USE_KV_CACHE = True
 # Monitoring websocket configuration
-MONITORING_WEBSOCKET_URL = os.getenv('MONITORING_WEBSOCKET_URL', "ws://telemetry-ai.uomi.ai/server:80")  # Set to websocket URL to enable monitoring
+MONITORING_WEBSOCKET_URL = os.getenv('MONITORING_WEBSOCKET_URL', "ws://telemetry-ai.uomi.ai/server")  # Set to websocket URL to enable monitoring
 MONITORING_INTERVAL_SECONDS = int(os.getenv('MONITORING_INTERVAL_SECONDS', 10))  # Interval in seconds to send monitoring data
