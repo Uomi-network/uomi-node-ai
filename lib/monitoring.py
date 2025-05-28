@@ -3,6 +3,7 @@ import threading
 import json
 import requests
 import websocket
+import socket
 import os
 import re
 from datetime import datetime
@@ -19,6 +20,8 @@ class MonitoringService:
         self.thread = None
         self.ws = None
         self.node_name = self._infer_node_name()
+        # Track the IDs of requests we've already sent to avoid resending
+        self.sent_request_ids = set()
         
     def start(self):
         """Start the monitoring service if websocket URL is configured"""
@@ -72,9 +75,19 @@ class MonitoringService:
     def _connect_websocket(self):
         """Connect to the websocket server"""
         try:
+            # Set a larger buffer size to handle the increased data volume
             self.ws = websocket.WebSocket()
-            self.ws.connect(self.websocket_url)
+            self.ws.connect(
+                self.websocket_url,
+                sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),),
+            )
             print(f"✅ Connected to monitoring websocket: {self.websocket_url}")
+            
+            # Reset the sent request tracking on new connections
+            # This ensures we don't miss any data if the connection was broken
+            self.sent_request_ids = set()
+            print("🔄 Reset request tracking on new connection")
+            
             return True
         except Exception as e:
             print(f"❌ Failed to connect to websocket: {e}")
@@ -92,12 +105,52 @@ class MonitoringService:
             enhanced_data = data.copy() if data else {}
             enhanced_data['node_name'] = self.node_name
             
+            # Extract and filter request data to only send new requests
+            if 'requests' in enhanced_data and 'all_requests' in enhanced_data['requests']:
+                all_requests = enhanced_data['requests']['all_requests']
+                new_requests = []
+                
+                for req in all_requests:
+                    # Ensure each request has an ID
+                    if 'id' not in req:
+                        timestamp = req.get('timestamp', datetime.now().isoformat())
+                        input_hash = hash(req.get('input', '')) & 0xffffffff
+                        req['id'] = f"{timestamp}_{input_hash}"
+                    
+                    # Only include requests we haven't sent before
+                    if req['id'] not in self.sent_request_ids:
+                        new_requests.append(req)
+                        self.sent_request_ids.add(req['id'])
+                
+                # Replace all_requests with only the new ones
+                enhanced_data['requests']['new_requests'] = new_requests
+                
+                # Keep track of how many total requests exist
+                enhanced_data['requests']['total_request_count'] = len(all_requests)
+                
+                # Remove the full all_requests array to reduce payload size
+                del enhanced_data['requests']['all_requests']
+                
+                # Log the delta information
+                new_req_count = len(new_requests)
+                if new_req_count > 0:
+                    print(f"📊 Sending {new_req_count} new requests (total tracked: {len(self.sent_request_ids)})")
+            
             message = {
                 "type": "monitoring",
                 "timestamp": datetime.now().isoformat(),
                 "data": enhanced_data
             }
-            self.ws.send(json.dumps(message))
+            
+            # Convert to JSON string
+            message_json = json.dumps(message)
+            
+            # Check if message is too large (>1MB) and potentially split
+            if len(message_json.encode('utf-8')) > 1000000:  # 1MB threshold
+                print(f"⚠️ Large monitoring payload detected ({len(message_json.encode('utf-8'))/1000000:.2f}MB), may impact performance")
+            
+            # Send the data
+            self.ws.send(message_json)
             return True
         except Exception as e:
             print(f"❌ Failed to send monitoring data: {e}")
@@ -107,7 +160,7 @@ class MonitoringService:
     def _get_monitoring_data(self):
         """Fetch monitoring data from the local endpoint"""
         try:
-            response = requests.get(self.monitoring_endpoint_url, timeout=5)
+            response = requests.get(self.monitoring_endpoint_url, timeout=15)  # Increased timeout for larger data
             if response.status_code == 200:
                 return response.json()
             else:
@@ -132,7 +185,9 @@ class MonitoringService:
                     if self._send_monitoring_data(monitoring_data):
                         consecutive_failures = 0
                         node_info = f" (node: {self.node_name})" if self.node_name else ""
-                        print(f"📊 Sent monitoring data{node_info} (uptime: {monitoring_data.get('uptime', {}).get('total_seconds', 0):.0f}s)")
+                        uptime_info = f"uptime: {monitoring_data.get('uptime', {}).get('total_seconds', 0):.0f}s"
+                        # The new_requests count is now handled in _send_monitoring_data
+                        print(f"📊 Sent monitoring data{node_info} ({uptime_info})")
                     else:
                         consecutive_failures += 1
                 else:

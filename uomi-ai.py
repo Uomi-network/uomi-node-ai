@@ -128,14 +128,23 @@ def run_json():
 
     # Track request statistics for monitoring
     request_time = time.time() - time_start
+    timestamp = datetime.datetime.now().isoformat()
+    input_text = data.get("input", "")
+    
+    # Create a unique ID by concatenating timestamp and a hash of the input
+    request_id = f"{timestamp}_{hash(input_text) & 0xffffffff}"
+    
     request_record = {
-        "timestamp": datetime.datetime.now().isoformat(),
+        "id": request_id,
+        "timestamp": timestamp,
         "time_taken": request_time,
         "model": data.get("model", "unknown"),
-        "input_length": len(data.get("input", "")),
+        "input_length": len(input_text),
         "tokens_per_second": 0,  # This would need to be calculated based on actual token generation
         "total_tokens_generated": 0,  # This would need to be extracted from the output
-        "success": True
+        "success": True,
+        "input": input_text,
+        "output": output.get("response", ""),
     }
     
     # Try to extract token information from output if available
@@ -156,8 +165,9 @@ def run_json():
             request_record["total_tokens_generated"] = 0
     request_history.append(request_record)
     
-    # Keep only the last 100 requests in history
-    if len(request_history) > 100:
+    # Keep only the last 1000 requests in history (up from 100)
+    # This allows for more comprehensive monitoring data
+    if len(request_history) > 1000:
         request_history.pop(0)
 
     # Return response
@@ -206,7 +216,8 @@ def monitoring_json():
         "average_request_time": sum(req["time_taken"] for req in request_history) / len(request_history) if request_history else 0,
         "average_tokens_per_second": sum(req["tokens_per_second"] for req in request_history) / len(request_history) if request_history else 0,
         "total_tokens_generated": sum(req["total_tokens_generated"] for req in request_history),
-        "recent_requests": request_history[-10:] if request_history else []  # Ultime 10 richieste
+        "recent_requests": request_history[-10:] if request_history else [],  # Last 10 requests for backwards compatibility
+        "all_requests": request_history  # All requests in the history
     }
     
     # Esegui la garbage collection per garantire che le statistiche siano accurate
