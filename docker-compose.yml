@@ -8,6 +8,10 @@ services:
       - ./:/app
     ports:
       - "8888:8888"
+    environment:
+      # Uncomment and configure to enable monitoring
+      # - MONITORING_WEBSOCKET_URL=ws://your-monitoring-server:8080/monitoring
+      # - MONITORING_INTERVAL_SECONDS=10
     deploy:
       resources:
         reservations:

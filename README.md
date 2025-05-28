@@ -64,14 +64,84 @@ sudo systemctl start uomi-ai
 
 ## 📊 Monitoring
 
-View service logs in real-time:
+UOMI Node AI includes built-in monitoring capabilities that can send real-time performance data to a WebSocket endpoint.
+
+### Configuration
+
+To enable monitoring, set the following environment variables:
+
 ```bash
-journalctl -f -u uomi-ai
+# Required: WebSocket URL to send monitoring data to
+export MONITORING_WEBSOCKET_URL="ws://your-monitoring-server.com:8080/monitoring"
+
+# Optional: Monitoring interval in seconds (default: 10)
+export MONITORING_INTERVAL_SECONDS=15
 ```
 
-Check service status:
+### Monitoring Data
+
+The monitoring service sends the following data every interval:
+
+- **System metrics**: CPU usage, memory usage, disk usage
+- **CUDA metrics**: GPU memory allocation, device information
+- **Request statistics**: Total requests, average response time, tokens per second
+- **Service uptime**: Days, hours, minutes, seconds since startup
+- **Garbage collection**: Memory cleanup statistics
+
+### Example Monitoring Data
+
+```json
+{
+  "type": "monitoring",
+  "timestamp": "2025-05-28T10:30:00.123456",
+  "data": {
+    "uptime": {
+      "total_seconds": 3600,
+      "days": 0,
+      "hours": 1,
+      "minutes": 0,
+      "seconds": 0
+    },
+    "system": {
+      "cpu_percent": 45.2,
+      "memory": {
+        "total_gb": 64.0,
+        "used_gb": 32.1,
+        "percent": 50.2
+      }
+    },
+    "cuda": {
+      "device_count": 2,
+      "devices": [
+        {
+          "name": "NVIDIA RTX 4090",
+          "memory_allocated": 12.5
+        }
+      ]
+    },
+    "requests": {
+      "total_requests": 150,
+      "average_request_time": 2.34,
+      "average_tokens_per_second": 45.6
+    }
+  }
+}
+```
+
+### Testing Monitoring
+
+Use the included test WebSocket server:
+
 ```bash
-systemctl status uomi-ai
+# Install websockets dependency for testing
+pip install websockets
+
+# Start test server
+./test_monitoring.sh
+
+# In another terminal, start uomi-ai with monitoring
+export MONITORING_WEBSOCKET_URL="ws://localhost:8080"
+python uomi-ai.py
 ```
 
 ## 🔧 API Usage

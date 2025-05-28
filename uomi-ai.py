@@ -4,10 +4,12 @@ import datetime
 import gc
 import psutil
 import torch
+import atexit
 from flask import Flask, request, jsonify
 from lib.config import UOMI_ENGINE_PALLET_VERSION, CACHE_ENABLED
 from lib.runner import RunnerQueue, RunnerExecutor
 from lib.system import System
+from lib.monitoring import MonitoringService
 
 print(' ')
 print('|' * 50)
@@ -34,6 +36,15 @@ app_cache = {}
 service_start_time = datetime.datetime.now()
 request_history = []
 cuda_available = system.check_cuda_availability()
+
+# Initialize monitoring service
+monitoring_service = MonitoringService(app)
+
+# Setup cleanup on exit
+def cleanup_services():
+    monitoring_service.stop()
+
+atexit.register(cleanup_services)
 
 @app.route('/status', methods=['GET'])
 def status_json():
@@ -222,4 +233,13 @@ def monitoring_json():
 
 if __name__ == "__main__":
     print("🚀 Starting Flask app...")
-    app.run(host='0.0.0.0', port=8888, debug=False)
+    
+    # Start monitoring service
+    monitoring_service.start()
+    
+    try:
+        app.run(host='0.0.0.0', port=8888, debug=False)
+    except KeyboardInterrupt:
+        print("\n🛑 Received interrupt signal")
+    finally:
+        cleanup_services()

@@ -32,7 +32,9 @@ RUN conda create -n uomi-ai python=3.10 -y && \
     pip install 'accelerate>=0.26.0' && \
     pip install autoawq && \
     pip install 'triton==3.2.0' && \
-    pip install diffusers
+    pip install diffusers && \
+    pip install websocket-client && \
+    pip install requests
 
 # Configure the container to always use the conda environment
 SHELL ["/bin/bash", "-c"]
