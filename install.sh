@@ -13,6 +13,7 @@ conda install -c nvidia/label/cuda-12.1.0 cuda-nvcc=12.1 cuda-toolkit=12.1
 conda install numpy=1.24
 pip install flask
 pip install psutil
+pip install websocket-client requests
 pip install transformers
 pip install 'accelerate>=0.26.0'
 pip install autoawq
