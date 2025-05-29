@@ -174,6 +174,7 @@ class MonitoringService:
         """Main monitoring loop that runs in a separate thread"""
         consecutive_failures = 0
         max_failures = 5
+        retry_delay_seconds = 120  # 2 minutes between retry attempts
         
         while self.running:
             try:
@@ -193,10 +194,19 @@ class MonitoringService:
                 else:
                     consecutive_failures += 1
                     
-                # Check if we should stop due to too many failures
+                # Check if we should implement backoff due to too many failures
                 if consecutive_failures >= max_failures:
-                    print(f"❌ Too many consecutive failures ({max_failures}), stopping monitoring service")
-                    break
+                    print(f"❌ Too many consecutive failures ({max_failures}), backing off for {retry_delay_seconds} seconds")
+                    # Wait for the retry delay before attempting again
+                    for _ in range(retry_delay_seconds // self.interval_seconds):
+                        if not self.running:
+                            break
+                        time.sleep(self.interval_seconds)
+                    
+                    # Reset failure counter to give it another chance
+                    consecutive_failures = max_failures // 2
+                    print(f"🔄 Retrying connection after backoff period")
+                    continue
                     
             except Exception as e:
                 print(f"❌ Error in monitoring loop: {e}")
