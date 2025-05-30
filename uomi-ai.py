@@ -88,10 +88,33 @@ def run_json():
     if "input" not in data:
         print('❌ Input parameter is required')
         return jsonify({"error": "input parameter is required"}), 400
-    # be sure input parameter is a string
-    if not isinstance(data["input"], str):
-        print('❌ Input parameter must be a string')
-        return jsonify({"error": "input parameter must be a string"}), 400
+    
+    # Handle both string and object formats for input
+    if isinstance(data["input"], str):
+        # Current format: input is a JSON string
+        try:
+            input_data = json.loads(data["input"])
+        except:
+            print('❌ Input parameter must be a valid JSON string or object')
+            return jsonify({"error": "input parameter must be a valid JSON string or object"}), 400
+    elif isinstance(data["input"], dict):
+        # New format: input is already an object
+        input_data = data["input"]
+    else:
+        print('❌ Input parameter must be a string or object')
+        return jsonify({"error": "input parameter must be a string or object"}), 400
+    
+    # validate enable_thinking parameter (can be in top level or inside input)
+    enable_thinking = data.get("enable_thinking", input_data.get("enable_thinking", True))
+    if not isinstance(enable_thinking, bool):
+        print('❌ enable_thinking parameter must be a boolean')
+        return jsonify({"error": "enable_thinking parameter must be a boolean"}), 400
+    
+    # Ensure enable_thinking is included in the input data
+    input_data["enable_thinking"] = enable_thinking
+    
+    # Convert back to string format for internal processing
+    data["input"] = json.dumps(input_data)
     
     # Add request to queue
     print('💬 Adding request to queue...')

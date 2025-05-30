@@ -3,7 +3,7 @@ import time
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
 import torch
@@ -65,6 +65,8 @@ class TransformersModelManager:
                 config.model_name,
                 **config.tokenizer_kwargs
             )
+            if config.tokenizer_kwargs.get("chat_template") is not None:
+                tokenizer.chat_template = config.tokenizer_kwargs["chat_template"]
             self.tokenizers[model_name] = tokenizer
             
             # Load model on CPU
@@ -175,12 +177,13 @@ class TransformersModelManager:
 
         print(f"Time taken to clear model for TRANSFORMERS MODEL MANAGER: {time.time() - time_start:.2f}s")
 
-    def run_batch_executions(self, prompts, on_prompt_finished):
+    def run_batch_executions(self, prompts, enable_thinking_list, on_prompt_finished):
         """
         Run inference on the current GPU model on a batch of prompts using the generate() method.
         
         Args:
             prompts: Input prompts for the model
+            enable_thinking_list: List of enable_thinking values for each prompt
             on_prompt_finished: Callback function to call when a prompt is finished
         """
         if self.current_gpu_model is None:
@@ -212,11 +215,12 @@ class TransformersModelManager:
         
         # Convert prompts to chat templates
         texts = []
-        for prompt in prompts:
+        for prompt, enable_thinking in zip(prompts, enable_thinking_list):
             text = tokenizer.apply_chat_template(
                 prompt,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking
             )
             texts.append(text)
 
@@ -323,12 +327,13 @@ class TransformersModelManager:
         
         return execution_time
 
-    def run_batch_checks(self, prompts, proofs, on_prompt_finished):
+    def run_batch_checks(self, prompts, enable_thinking_list, proofs, on_prompt_finished):
         """
         Verify that each token in the generated sequence is among the top 10 predicted tokens.
 
         Args:
             prompts: List of input prompts (e.g., chat messages).
+            enable_thinking_list: List of enable_thinking values for each prompt
             proofs: List of proofs, each containing generated token IDs (e.g., [{"id": token_id}, ...]).
             on_prompt_finished: Callback function to call with verification results.
         """
@@ -357,9 +362,9 @@ class TransformersModelManager:
         full_input_ids = []
         full_attention_masks = []
         prompt_lengths = []
-        for prompt, proof in zip(prompts, proofs):
+        for prompt, enable_thinking, proof in zip(prompts, enable_thinking_list, proofs):
             # Tokenize prompt with chat template
-            prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+            prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
             prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0]
             # Extract proof token IDs
             proof_ids = torch.tensor([t["id"] for t in proof["tokens"]], dtype=torch.long)
@@ -445,6 +450,8 @@ class TransformersModelManager:
             raise KeyError(f"Tokenizer for model {model_name} not found")
         return self.tokenizers[model_name]
 
+quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+
 TRANSFORMERS_MODEL_CONFIG = {
     'casperhansen/mistral-small-24b-instruct-2501-awq': TransformersModelConfig(
         model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
@@ -472,5 +479,20 @@ TRANSFORMERS_MODEL_CONFIG = {
             "use_cache": True
         },
         tokenizer_kwargs={}
+    ),
+    'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B': TransformersModelConfig(
+        model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
+        deterministic=False,
+        location="cpu",
+        model_kwargs={
+            "use_cache": True,
+            # "quantization_config": quantization_config
+            # "load_in_4bit": True,
+        },
+        tokenizer_kwargs={
+            # "load_in_4bit": True,
+            # "quantization_config": quantization_config
+            "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true, is_last_user=false) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{% set content = message['content'] %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{%- set ns.is_first = false -%}{%- set ns.is_last_user = true -%}{{'<｜User｜>' + content + '<｜Assistant｜>'}} {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}{%- if message['role'] == 'assistant' %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{% endif %}{%- if message['role'] == 'assistant' and message['tool_calls'] is defined and message['tool_calls'] is not none %}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{%- endif %}{%- set ns.is_first = false %}{%- set ns.is_tool = false -%}{%- set ns.is_output_first = true %}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if content is none %}{{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none)%}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + content + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_last_user = false -%}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'\n<｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_last_user and not ns.is_tool %}{{'<｜Assistant｜>'}} \n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n {% endif %}"
+        }
     ),
 }

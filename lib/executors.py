@@ -32,6 +32,12 @@ class ChatExecutor(AbstractExecutor):
         # Be sure messages input is a list
         if not isinstance(input_data["messages"], list):
             return self._generate_error("messages parameter must be a list")
+        
+        # Validate enable_thinking parameter (optional, defaults to True)
+        if "enable_thinking" in input_data:
+            if not isinstance(input_data["enable_thinking"], bool):
+                return self._generate_error("enable_thinking parameter must be a boolean")
+        
         # Be sure messages are objects with role and content keys, be sure content is a string and role is a string with values "system" or "user" or "assistant"
         for message in input_data["messages"]:
             if not isinstance(message, dict):
@@ -101,8 +107,10 @@ class ChatExecutor(AbstractExecutor):
         for i, input in enumerate(inputs):
             error = self._validate_input(input)
             if error is None:
+                input_data = json.loads(input)
                 valid_inputs.append({
-                    "messages": json.loads(input)["messages"],
+                    "messages": input_data["messages"],
+                    "enable_thinking": input_data.get("enable_thinking", True),
                     "index": i
                 })
             else:
@@ -113,7 +121,7 @@ class ChatExecutor(AbstractExecutor):
         # Run valid inputs
         def on_valid_input_finished(index, output):
             on_input_finished(valid_inputs[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
-        model_manager.run_batch_executions([input["messages"] for input in valid_inputs], on_valid_input_finished)
+        model_manager.run_batch_executions([input["messages"] for input in valid_inputs], [input["enable_thinking"] for input in valid_inputs], on_valid_input_finished)
 
     def check(self, inputs, proofs, model_manager, on_input_finished):
         valid_inputs_with_tokens = []
@@ -123,8 +131,10 @@ class ChatExecutor(AbstractExecutor):
             error_input = self._validate_input(input)
             error_proof = self._validate_proof(proofs[i])
             if error_input is None and error_proof is None:
+                input_data = json.loads(input)
                 valid_inputs_with_tokens.append({
-                    "messages": json.loads(input)["messages"],
+                    "messages": input_data["messages"],
+                    "enable_thinking": input_data.get("enable_thinking", True),
                     "proof": json.loads(unzip_string(proofs[i])),
                     "index": i
                 })
@@ -136,7 +146,7 @@ class ChatExecutor(AbstractExecutor):
         # Run valid inputs
         def on_valid_input_finished(index, output):
             on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
-        model_manager.run_batch_checks([input["messages"] for input in valid_inputs_with_tokens], [input["proof"] for input in valid_inputs_with_tokens], on_valid_input_finished)
+        model_manager.run_batch_checks([input["messages"] for input in valid_inputs_with_tokens], [input["enable_thinking"] for input in valid_inputs_with_tokens], [input["proof"] for input in valid_inputs_with_tokens], on_valid_input_finished)
 
 class ImageExecutor(AbstractExecutor):
     def _validate_input(self, input):

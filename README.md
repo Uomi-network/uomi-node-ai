@@ -162,9 +162,33 @@ The service exposes an HTTP endpoint at `http://localhost:8888/run` accepting PO
         "content": "User input here"
       }
     ]
+  },
+  "enable_thinking": true
+}
+```
+
+The `enable_thinking` parameter is optional and defaults to `true`. It controls whether the model should use thinking mode in the chat template. You can also specify it within the input object:
+
+```json
+{
+  "model": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+  "input": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "System message here"
+      },
+      {
+        "role": "user",
+        "content": "User input here"
+      }
+    ],
+    "enable_thinking": false
   }
 }
 ```
+
+*Note:* The only model that supports `enable_thinking` is `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`. For other models, this parameter will be ignored.
 
 ## ⚙️ Configuration
 

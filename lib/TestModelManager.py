@@ -44,7 +44,7 @@ class TestModelManager:
 
         print(f"Time taken to clear model for TEST MODEL MANAGER: {time.time() - time_start:.2f}s")
 
-    def run_batch_executions(self, prompts, on_prompt_finished):
+    def run_batch_executions(self, prompts, enable_thinking_list, on_prompt_finished):
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
             return None
@@ -60,7 +60,7 @@ class TestModelManager:
                 "full_sequence_length": 1
             } })
 
-    def run_batch_checks(self, prompts, proofs, on_prompt_finished):
+    def run_batch_checks(self, prompts, enable_thinking_list, proofs, on_prompt_finished):
         if self.current_gpu_model is None:
             print("No model loaded on GPU")
             return None
