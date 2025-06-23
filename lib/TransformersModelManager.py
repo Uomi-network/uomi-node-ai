@@ -480,8 +480,8 @@ TRANSFORMERS_MODEL_CONFIG = {
         },
         tokenizer_kwargs={}
     ),
-    'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B': TransformersModelConfig(
-        model_name='deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+    'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B': TransformersModelConfig(
+        model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
         deterministic=False,
         location="cpu",
         keep_in_memory=True,
