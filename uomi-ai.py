@@ -105,7 +105,7 @@ def run_json():
         return jsonify({"error": "input parameter must be a string or object"}), 400
     
     # validate enable_thinking parameter (can be in top level or inside input)
-    enable_thinking = data.get("enable_thinking", input_data.get("enable_thinking", True))
+    enable_thinking = data.get("enable_thinking", input_data.get("enable_thinking", False))
     if not isinstance(enable_thinking, bool):
         print('❌ enable_thinking parameter must be a boolean')
         return jsonify({"error": "enable_thinking parameter must be a boolean"}), 400

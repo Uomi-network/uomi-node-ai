@@ -453,24 +453,24 @@ class TransformersModelManager:
 quantization_config = BitsAndBytesConfig(load_in_4bit=True)
 
 TRANSFORMERS_MODEL_CONFIG = {
-    'casperhansen/mistral-small-24b-instruct-2501-awq': TransformersModelConfig(
-        model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
-        deterministic=True,
-        location="cpu",
-        model_kwargs={
-            "use_cache": True
-        },
-        tokenizer_kwargs={}
-    ),
-    'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
-        model_name='Qwen/QwQ-32B-AWQ',
-        deterministic=False,
-        location="cpu",
-        model_kwargs={
-            "use_cache": True
-        },
-        tokenizer_kwargs={}
-    ),
+    # 'casperhansen/mistral-small-24b-instruct-2501-awq': TransformersModelConfig(
+    #     model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
+    #     deterministic=True,
+    #     location="cpu",
+    #     model_kwargs={
+    #         "use_cache": True
+    #     },
+    #     tokenizer_kwargs={}
+    # ),
+    # 'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
+    #     model_name='Qwen/QwQ-32B-AWQ',
+    #     deterministic=False,
+    #     location="cpu",
+    #     model_kwargs={
+    #         "use_cache": True
+    #     },
+    #     tokenizer_kwargs={}
+    # ),
     'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
         model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
         deterministic=False,
@@ -484,6 +484,7 @@ TRANSFORMERS_MODEL_CONFIG = {
         model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
         deterministic=False,
         location="cpu",
+        keep_in_memory=True,
         model_kwargs={
             "use_cache": True,
             # "quantization_config": quantization_config
@@ -495,4 +496,4 @@ TRANSFORMERS_MODEL_CONFIG = {
             "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true, is_last_user=false) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{% set content = message['content'] %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{%- set ns.is_first = false -%}{%- set ns.is_last_user = true -%}{{'<｜User｜>' + content + '<｜Assistant｜>'}} {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}{%- if message['role'] == 'assistant' %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{% endif %}{%- if message['role'] == 'assistant' and message['tool_calls'] is defined and message['tool_calls'] is not none %}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{%- endif %}{%- set ns.is_first = false %}{%- set ns.is_tool = false -%}{%- set ns.is_output_first = true %}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if content is none %}{{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none)%}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + content + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_last_user = false -%}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'\n<｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_last_user and not ns.is_tool %}{{'<｜Assistant｜>'}} \n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n {% endif %}"
         }
     ),
-}
+    }
