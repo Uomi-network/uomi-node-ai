@@ -109,7 +109,9 @@ class RunnerExecutor:
                         chat_executor.check([request["request"]["input"] for request in batch], [request["request"]["proof"] for request in batch], self.transformers_model_manager, on_output_finished)
                     else:
                         chat_executor.execute([request["request"]["input"] for request in batch], self.transformers_model_manager, on_output_finished)
-                    self.transformers_model_manager.clear_model()
+                    keep_in_memory = TRANSFORMERS_MODEL_CONFIG[model].keep_in_memory if model in TRANSFORMERS_MODEL_CONFIG else False
+                    if not keep_in_memory:
+                        self.transformers_model_manager.clear_model()
                 elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                     self.sana_model_manager.switch_model(model)
                     def on_output_finished(index, output):
