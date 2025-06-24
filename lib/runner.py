@@ -80,6 +80,8 @@ class RunnerExecutor:
                 if model not in TEST_MODEL_CONFIG and model not in TRANSFORMERS_MODEL_CONFIG and model not in SANA_MODEL_CONFIG:
                     # fallback to deepseek an agent sent something from an older version of the pallet. Could happen if not all validators updated yet.
                     model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+                    pending_requests[0]["request"]["model"] = model
+                    # TODO: remove this fallback when all validators are updated to the latest pallet version
 
                 is_check = True if "proof" in pending_requests[0]["request"] else False
                 # Generate the batch by taking the first BATCH_MAX_SIZE requests with the same model and is_check
