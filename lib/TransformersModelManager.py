@@ -471,7 +471,7 @@ TRANSFORMERS_MODEL_CONFIG = {
     #     },
     #     tokenizer_kwargs={}
     # ),
-    'SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
+    'SentientAGI/Dobsby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
         model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
         deterministic=False,
         location="disk",

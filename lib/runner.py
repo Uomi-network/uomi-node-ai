@@ -76,6 +76,11 @@ class RunnerExecutor:
                 pending_requests = sorted(pending_requests, key=lambda x: x["timestamp_pending"])
                 # Take the model and is_check of the first request
                 model = pending_requests[0]["request"]["model"]
+
+                if model not in TEST_MODEL_CONFIG and model not in TRANSFORMERS_MODEL_CONFIG and model not in SANA_MODEL_CONFIG:
+                    # fallback to deepseek an agent sent something from an older version of the pallet. Could happen if not all validators updated yet.
+                    model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+
                 is_check = True if "proof" in pending_requests[0]["request"] else False
                 # Generate the batch by taking the first BATCH_MAX_SIZE requests with the same model and is_check
                 batch = [request for request in pending_requests if request["request"]["model"] == model and ("proof" in request["request"]) == is_check][:BATCH_MAX_SIZE]
