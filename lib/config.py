@@ -11,7 +11,7 @@ BATCH_WAIT_SEC = 0.1
 # Folder for caching models
 MODELS_FOLDER = "./models"
 # Inference settings for transformers models
-TRANSFORMERS_INFERENCE_MAX_TOKENS = 1024
+TRANSFORMERS_INFERENCE_MAX_TOKENS = 4096
 TRANSFORMERS_INFERENCE_TEMPERATURE = 0.6
 # KV Cache
 USE_KV_CACHE = True
