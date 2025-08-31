@@ -8,6 +8,7 @@ from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFO
 from transformers import LogitsProcessor
 import torch
 import time
+import gc
 
 from transformers import (
     TemperatureLogitsWarper,
