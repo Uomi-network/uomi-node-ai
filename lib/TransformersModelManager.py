@@ -8,6 +8,7 @@ from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFO
 from transformers import LogitsProcessor
 import torch
 import time
+import gc
 
 from transformers import (
     TemperatureLogitsWarper,
@@ -129,19 +130,23 @@ class TransformersModelManager:
 
         # Clear existing GPU model if present
         self.clear_model()
-        
-        # Move new model to GPU from CPU
-        if model_config.location == "cpu":
-            self.current_gpu_model = self.cpu_models[model_name].to("cuda")
-            self.current_gpu_model_name = model_name
 
-            torch.cuda.synchronize()  # Synchronize CUDA operations
+        #  MODE: CPU → MULTI-GPU ---
+        if model_config.location == "cpu":
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                model_config.model_name,
+                device_map="auto",   # <== use all available gpus
+                torch_dtype=torch.float16,
+                cache_dir=MODELS_FOLDER,
+                **model_config.model_kwargs
+            )
+            self.current_gpu_model_name = model_name
         
         # Load model from disk to GPU
         elif model_config.location == "disk":
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 model_config.model_name,
-                device_map="cuda",
+                device_map="auto",
                 torch_dtype=torch.float16,  # Use float16 for memory efficiency
                 cache_dir=MODELS_FOLDER,
                 # attn_implementation="flash_attention_2",
@@ -156,25 +161,43 @@ class TransformersModelManager:
         print(f"Time taken to switch model: {time.time() - time_start:.2f}s")
         return self.current_gpu_model
 
+
     def clear_model(self):
         """
-        Remove the current model from GPU if one exists.
+        Free the current model in VRAM.
+        Keep preloaded CPU models in RAM.
         """
         time_start = time.time()
-        if self.current_gpu_model is not None:
-            if self.models_config[self.current_gpu_model_name].location == "cpu":
-                # Move model back to CPU
-                self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu")
 
-            # Clear GPU model references
-            self.current_gpu_model = None
-            self.current_gpu_model_name = None
-            
-            # Clear CUDA cache
-            torch.cuda.empty_cache()
+        if self.current_gpu_model is None:
+            return
 
-            # Ensure all CUDA operations are finished
-            torch.cuda.synchronize()
+        try:
+            # For multi-GPU models
+            if hasattr(self.current_gpu_model, "hf_device_map"):
+                # Unload each sub module
+                for device in set(self.current_gpu_model.hf_device_map.values()):
+                    if device != "disk" and "cpu" not in str(device):
+                        with torch.cuda.device(device):
+                            torch.cuda.empty_cache()
+
+            # Delete reference to GPU
+            del self.current_gpu_model
+
+        except Exception as e:
+            print(f"[WARN] clear_model: Erreur lors de la libération : {e}")
+
+        # Force garbage collector Python
+        gc.collect()
+
+        # Free memory from all GPUs
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+
+        self.current_gpu_model = None
+        self.current_gpu_model_name = None
 
         print(f"Time taken to clear model for TRANSFORMERS MODEL MANAGER: {time.time() - time_start:.2f}s")
 
