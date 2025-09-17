@@ -4,7 +4,7 @@ import uuid
 from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
-from lib.TransformersModelManager import TRANSFORMERS_MODEL_CONFIG, TransformersModelManager
+from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
 from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
 class RunnerQueue:
@@ -47,12 +47,15 @@ class RunnerExecutor:
         print('Initialize RunnerExecutor')
         self.kill = False
         self.queue = queue
+        # Micro-batching accumulation window in milliseconds (set 0 to disable)
+        self.microbatch_window_ms = 30
         self.test_model_manager = TestModelManager(TEST_MODEL_CONFIG)
         if test_mode:
             self.transformers_model_manager = None
             self.sana_model_manager = None
         else:
-            self.transformers_model_manager = TransformersModelManager(TRANSFORMERS_MODEL_CONFIG)
+            # Single DeepSeek transformers model always resident
+            self.transformers_model_manager = TransformersModelManager(DEEPSEEK_MODEL_CONFIG)
             self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
@@ -77,28 +80,50 @@ class RunnerExecutor:
             with self.lock:
                 pending_requests = [request for request in self.queue.get_requests().values() if request["status"] == "pending"]
                 if len(pending_requests) == 0:
-                    pass  # Will sleep outside lock
+                    pass
                 else:
-                    # Sort pending_requests by timestamp_pending
                     pending_requests = sorted(pending_requests, key=lambda x: x["timestamp_pending"])
-                    # Take the model and is_check of the first request
-                    model = pending_requests[0]["request"]["model"]
+                    first = pending_requests[0]
+                    model = first["request"]["model"]
+                    if model not in TEST_MODEL_CONFIG and model not in SANA_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
+                        model = DEEPSEEK_MODEL_CONFIG.model_name
+                        first["request"]["model"] = model
+                    is_check = "proof" in first["request"]
+                    batch = [r for r in pending_requests if r["request"]["model"] == model and ("proof" in r["request"]) == is_check][:BATCH_MAX_SIZE]
 
-                    if model not in TEST_MODEL_CONFIG and model not in TRANSFORMERS_MODEL_CONFIG and model not in SANA_MODEL_CONFIG:
-                        # fallback to deepseek an agent sent something from an older version of the pallet. Could happen if not all validators updated yet.
-                        model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-                        pending_requests[0]["request"]["model"] = model
-                        # TODO: remove this fallback when all validators are updated to the latest pallet version
+            # Micro-batch accumulation (outside lock)
+            if batch and len(batch) < BATCH_MAX_SIZE and self.microbatch_window_ms > 0:
+                deadline = time.time() + self.microbatch_window_ms / 1000.0
+                selected_ids = {r["uuid"] for r in batch}
+                while time.time() < deadline and len(batch) < BATCH_MAX_SIZE:
+                    time.sleep(0.005)
+                    with self.lock:
+                        more_pending = [req for req in self.queue.get_requests().values() if req["status"] == "pending"]
+                        if not more_pending:
+                            continue
+                        more_pending = sorted(more_pending, key=lambda x: x["timestamp_pending"])
+                        for req in more_pending:
+                            if req["uuid"] in selected_ids:
+                                continue
+                            # Normalize model if legacy
+                            req_model = req["request"].get("model")
+                            if req_model not in TEST_MODEL_CONFIG and req_model not in SANA_MODEL_CONFIG and req_model != DEEPSEEK_MODEL_CONFIG.model_name:
+                                req["request"]["model"] = DEEPSEEK_MODEL_CONFIG.model_name
+                                req_model = DEEPSEEK_MODEL_CONFIG.model_name
+                            if req_model == model and ("proof" in req["request"]) == is_check:
+                                batch.append(req)
+                                selected_ids.add(req["uuid"])
+                                if len(batch) >= BATCH_MAX_SIZE:
+                                    break
 
-                    is_check = True if "proof" in pending_requests[0]["request"] else False
-                    # Generate the batch by taking the first BATCH_MAX_SIZE requests with the same model and is_check
-                    batch = [request for request in pending_requests if request["request"]["model"] == model and ("proof" in request["request"]) == is_check][:BATCH_MAX_SIZE]
-                    
-                    # Mark batch as running
-                    for request in batch:
-                        request["status"] = "running"
-                        request["timestamp_running"] = time.time()
-                        request["batch"] = [req["uuid"] for req in batch]
+            # Mark batch as running after micro-accumulation
+            if batch:
+                with self.lock:
+                    batch_ids = [req["uuid"] for req in batch]
+                    for req in batch:
+                        req["status"] = "running"
+                        req["timestamp_running"] = time.time()
+                        req["batch"] = batch_ids
             
             # Step 2: Handle no work case (outside lock)
             if not batch:
@@ -109,7 +134,7 @@ class RunnerExecutor:
             try:
                 print('🤖 Running batch with ' + str(len(batch)) + ' requests')
                 self.test_model_manager.clear_model()
-                self.transformers_model_manager.clear_model() if self.transformers_model_manager is not None else None
+                # Do not clear transformers model (always resident)
                 self.sana_model_manager.clear_model() if self.sana_model_manager is not None else None
                 
                 if model in TEST_MODEL_CONFIG:
@@ -126,8 +151,8 @@ class RunnerExecutor:
                     else:
                         chat_executor.execute([request["request"]["input"] for request in batch], self.test_model_manager, on_output_finished)
                     self.test_model_manager.clear_model()
-                elif model in TRANSFORMERS_MODEL_CONFIG and self.transformers_model_manager is not None:
-                    self.transformers_model_manager.switch_model(model)
+                elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_manager is not None:
+                    # Single transformers model already loaded
                     def on_output_finished(index, output):
                         # Use minimal lock for status update only
                         if index < len(batch):
@@ -139,9 +164,7 @@ class RunnerExecutor:
                         chat_executor.check([request["request"]["input"] for request in batch], [request["request"]["proof"] for request in batch], self.transformers_model_manager, on_output_finished)
                     else:
                         chat_executor.execute([request["request"]["input"] for request in batch], self.transformers_model_manager, on_output_finished)
-                    keep_in_memory = TRANSFORMERS_MODEL_CONFIG[model].keep_in_memory if model in TRANSFORMERS_MODEL_CONFIG else False
-                    if not keep_in_memory:
-                        self.transformers_model_manager.clear_model()
+                    # Always keep in memory now
                 elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                     self.sana_model_manager.switch_model(model)
                     def on_output_finished(index, output):
