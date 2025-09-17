@@ -41,7 +41,9 @@ class FastContinuousBatcher:
         
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
+        # Use the actual device of the model, not the passed device
+        self.device = next(model.parameters()).device if hasattr(model, 'parameters') else device
+        print(f"[fast_batcher] Using device: {self.device}")
         self.max_active = max_active
         self.pending: Deque[BatchRequest] = deque()
         self.active: Dict[str, BatchRequest] = {}
