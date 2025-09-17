@@ -1,7 +1,7 @@
 import os
 
 # UOMI Engine version
-UOMI_ENGINE_PALLET_VERSION = 6
+UOMI_ENGINE_PALLET_VERSION = 7
 # Enable/disable usage of caching on the server
 CACHE_ENABLED = False
 # Max number of requests executed in batch mode
