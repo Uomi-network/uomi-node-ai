@@ -68,13 +68,59 @@ class TransformersModelManager:
         # Load model
         print(f"Loading model {self.model_name} to device {self.device}")
         load_dtype = torch.float16 if self.device == 'cuda' else torch.float32
-        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-            self.model_config.model_name,
-            device_map='balanced',
-            torch_dtype=load_dtype,  # use new 'dtype' arg (replaces deprecated torch_dtype)
-            cache_dir=MODELS_FOLDER,
-            **self.model_config.model_kwargs
-        )
+        # Allow overriding attention implementation / device map / max memory via env without code change
+        # ATTN_IMPL example: flash_attention_2 (if supported by installed transformers version)
+        attn_impl = os.getenv("ATTN_IMPL")
+        if attn_impl:
+            # do not overwrite if user already passed something explicitly
+            self.model_config.model_kwargs.setdefault("attn_implementation", attn_impl)
+
+        # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
+        max_memory_env = os.getenv("MAX_MEMORY")
+        max_memory = None
+        if max_memory_env:
+            try:
+                max_memory = {}
+                for part in max_memory_env.split(','):
+                    gid, cap = part.split(':', 1)
+                    max_memory[int(gid.strip())] = cap.strip()
+            except Exception as e:
+                print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
+                max_memory = None
+
+        device_map_env = os.getenv("DEVICE_MAP", "auto")
+        try:
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map=device_map_env,
+                max_memory=max_memory,
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                **self.model_config.model_kwargs
+            )
+        except Exception as e:
+            print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map='auto',
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                **self.model_config.model_kwargs
+            )
+
+        # Optional torch.compile acceleration
+        if os.getenv("TORCH_COMPILE", "0") == "1":
+            compile_mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
+            try:
+                import torch
+                self.current_gpu_model = torch.compile(self.current_gpu_model, mode=compile_mode, fullgraph=False)
+                print(f"[compile] Enabled torch.compile mode={compile_mode}")
+            except Exception as e:
+                print(f"[compile] Skipped torch.compile: {e}")
+
+        # Report resolved device map for observability
+        if hasattr(self.current_gpu_model, 'hf_device_map'):
+            print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
         if self.device == 'cpu':
             print("CUDA not available, model loaded on CPU")
 
