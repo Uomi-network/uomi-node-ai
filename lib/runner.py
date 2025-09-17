@@ -6,7 +6,7 @@ from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MA
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
 from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
-from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
+# from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
 class RunnerQueue:
     def __init__(self):
@@ -58,7 +58,7 @@ class RunnerExecutor:
             # Single DeepSeek transformers model always resident (enable continuous batching)
             self.transformers_model_manager = TransformersModelManager(DEEPSEEK_MODEL_CONFIG)
             self.transformers_model_manager.enable_continuous(max_active=BATCH_MAX_SIZE)
-            self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
+            # self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
         self.thread.start()
@@ -145,13 +145,13 @@ class RunnerExecutor:
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         self.transformers_model_manager.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
-                    elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
-                        def on_finished(_idx, output, rq=req):
-                            with self.lock:
-                                rq["status"] = "finished"
-                                rq["timestamp_finished"] = time.time()
-                                rq["output"] = output
-                        ImageExecutor().execute([req["request"]["input"]], self.sana_model_manager, on_finished)
+                    # elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
+                    #     def on_finished(_idx, output, rq=req):
+                    #         with self.lock:
+                    #             rq["status"] = "finished"
+                    #             rq["timestamp_finished"] = time.time()
+                    #             rq["output"] = output
+                    #     ImageExecutor().execute([req["request"]["input"]], self.sana_model_manager, on_finished)
                     else:
                         with self.lock:
                             req["status"] = "finished"
