@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
-from torch.cuda import is_
 from transformers import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
