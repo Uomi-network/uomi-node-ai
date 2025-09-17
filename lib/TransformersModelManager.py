@@ -105,6 +105,17 @@ class TransformersModelManager:
                 cache_dir=MODELS_FOLDER,
                 **self.model_config.model_kwargs
             )
+        
+        # Force model to GPU if it ended up on CPU despite CUDA availability
+        model_device = next(self.current_gpu_model.parameters()).device
+        if str(model_device) == 'cpu' and self.device == 'cuda':
+            print(f"[model-load] Moving model from CPU to {self.device}")
+            try:
+                self.current_gpu_model = self.current_gpu_model.to(self.device)
+                print(f"[model-load] Successfully moved model to {self.device}")
+            except Exception as e:
+                print(f"[model-load] Failed to move model to GPU: {e}")
+                self.device = 'cpu'  # Fallback to CPU
 
         # Optional torch.compile acceleration
         if os.getenv("TORCH_COMPILE", "0") == "1":
@@ -118,8 +129,16 @@ class TransformersModelManager:
         # Report resolved device map for observability
         if hasattr(self.current_gpu_model, 'hf_device_map'):
             print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
+        
+        # Report actual model device placement
+        model_device = next(self.current_gpu_model.parameters()).device
+        print(f"[model-load] Model loaded on device: {model_device}")
+        
         if self.device == 'cpu':
             print("CUDA not available, model loaded on CPU")
+        elif str(model_device) == 'cpu' and self.device == 'cuda':
+            print("⚠️  WARNING: Model ended up on CPU despite CUDA being available!")
+            print("⚠️  This will cause 0% GPU utilization!")
 
         # Continuous batcher disabled by default
         self.continuous_batcher: ContinuousBatcher | None = None
