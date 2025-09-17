@@ -70,7 +70,7 @@ class TransformersModelManager:
         load_dtype = torch.float16 if self.device == 'cuda' else torch.float32
         self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
             self.model_config.model_name,
-            device_map=self.device if self.device == 'cuda' else None,
+            device_map='auto',
             torch_dtype=load_dtype,  # use new 'dtype' arg (replaces deprecated torch_dtype)
             cache_dir=MODELS_FOLDER,
             **self.model_config.model_kwargs
