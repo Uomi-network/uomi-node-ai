@@ -83,7 +83,7 @@ class RunnerExecutor:
                 continue
             for req in sorted(pending, key=lambda r: r["timestamp_pending"]):
                 model = req["request"].get("model")
-                if model not in TEST_MODEL_CONFIG and model not in SANA_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
+                if model not in TEST_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
                     model = DEEPSEEK_MODEL_CONFIG.model_name
                     req["request"]["model"] = model
                 is_check = "proof" in req["request"]
