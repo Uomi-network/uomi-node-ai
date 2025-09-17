@@ -1,4 +1,5 @@
 import time
+import os
 import sys
 import datetime
 import gc
@@ -67,6 +68,7 @@ def run_json():
     data = request.get_json()
 
     # Check if the response can be returned from cache
+    body_hash = None
     if CACHE_ENABLED:
         print('💬 Checking response on cache...')
         body_hash = hash(str(data))
@@ -121,15 +123,26 @@ def run_json():
     request_uuid = runner_queue.add_request(data)
     print('💬 Request added to queue with UUID ' + str(request_uuid))
 
-    # Wait for the request to be processed
+    # Wait for the request to be processed (with timeout)
     print('💬 Waiting for request to be processed...')
+    deadline = time.time() + float(os.getenv('REQUEST_TIMEOUT_SECONDS', '120'))
+    last_log = 0
     while True:
         request_data = runner_queue.get_request(request_uuid)
+        if request_data is None:
+            print('❌ Request disappeared from queue unexpectedly')
+            return jsonify({"error": "Internal queue error"}), 500
         if request_data["status"] == "finished":
             print('💬 Request finished!')
             output = request_data["output"]
             runner_queue.remove_request(request_uuid)
             break
+        if time.time() > deadline:
+            print('❌ Request timed out')
+            return jsonify({"error": "Request timed out"}), 504
+        if time.time() - last_log > 5:
+            print(f"⏳ Still waiting... status={request_data['status']}")
+            last_log = time.time()
         time.sleep(0.1)
 
     # Check if output is valid

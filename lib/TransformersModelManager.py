@@ -15,6 +15,7 @@ from transformers import (
     TopKLogitsWarper,
     MinPLogitsWarper
 )
+from lib.continuous_batcher import ContinuousBatcher
 
 class Sampling:
     def __init__(self, seed: int, device: str = "cpu"):
@@ -76,6 +77,19 @@ class TransformersModelManager:
         )
         if self.device == 'cpu':
             print("CUDA not available, model loaded on CPU")
+
+        # Continuous batcher disabled by default
+        self.continuous_batcher: ContinuousBatcher | None = None
+
+    def enable_continuous(self, max_active: int | None = None):
+        if self.continuous_batcher is None:
+            self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+        return self.continuous_batcher
+
+    def submit_continuous(self, messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=False, forced_tokens=None):
+        if self.continuous_batcher is None:
+            raise RuntimeError("Continuous batching not enabled. Call enable_continuous() first.")
+        return self.continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
 
     def switch_model(self, model_name: str):
         if model_name != self.model_name:
