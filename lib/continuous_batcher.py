@@ -51,7 +51,7 @@ class ContinuousBatcher:
         self._batched_past = None
         self._decoding_started = False
         self.rolling_mode = os.getenv("CONTINUOUS_ROLLING", "0") == "1"
-        self.use_paged_kv = os.getenv("USE_PAGED_KV", "0") == "1"
+        self.use_paged_kv = os.getenv("USE_PAGED_KV", "1") == "1"
         self._paged_allocator = None
         self._seq_kv_map = {}  # seq_id -> SequenceKV
         if self.use_paged_kv:
@@ -324,7 +324,7 @@ class ContinuousBatcher:
     def _advance_sequence(self, seq: SequenceState, logits):
         if seq.finished:
             return
-        max_seconds = float(os.getenv("CONTINUOUS_MAX_SECONDS", "30"))
+        max_seconds = float(os.getenv("CONTINUOUS_MAX_SECONDS", "3600"))
         if (time.time() - seq.arrival_time) > max_seconds:
             seq.finished = True
             if seq.on_complete:

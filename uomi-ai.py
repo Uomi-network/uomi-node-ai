@@ -125,7 +125,7 @@ def run_json():
 
     # Wait for the request to be processed (with timeout)
     print('💬 Waiting for request to be processed...')
-    deadline = time.time() + float(os.getenv('REQUEST_TIMEOUT_SECONDS', '120'))
+    deadline = time.time() + float(os.getenv('REQUEST_TIMEOUT_SECONDS', '3600'))
     last_log = 0
     while True:
         request_data = runner_queue.get_request(request_uuid)
