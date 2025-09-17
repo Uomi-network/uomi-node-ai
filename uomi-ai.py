@@ -141,7 +141,7 @@ def run_json():
             print('❌ Request timed out')
             return jsonify({"error": "Request timed out"}), 504
         if time.time() - last_log > 5:
-            print(f"⏳ Still waiting... status={request_data['status']}")
+            print(f"⏳ Still waiting... status={request_data['status']} id={request_uuid}")
             last_log = time.time()
         time.sleep(0.1)
 

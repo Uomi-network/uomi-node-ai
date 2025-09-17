@@ -118,7 +118,7 @@ class RunnerExecutor:
                         # Determine max_new_tokens with safe cap (env var MAX_NEW_TOKENS, default 128)
                         req_max_new = req["request"].get("max_new_tokens") or payload.get("max_new_tokens")
                         try:
-                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", "128"))
+                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", "4096"))
                         except Exception:
                             max_new_tokens = 128
                         max_new_tokens = max(1, min(max_new_tokens, 1024))  # hard cap to protect CPU/GPU
@@ -132,7 +132,8 @@ class RunnerExecutor:
                         else:
                             forced_ids = None
                         def on_token(sid, txt, meta, rq=req):
-                            pass  # TODO: streaming hook integration
+                            if os.getenv('CONTINUOUS_DEBUG','0') == '1':
+                                print(f"[stream] req={rq['uuid']} sid={sid[:6]} token={meta.get('id')} txt='{txt}'")
                         def on_complete(sid, response, proof, rq=req):
                             from lib.zipper import zip_string
                             import json as _j
@@ -141,6 +142,8 @@ class RunnerExecutor:
                                 rq["status"] = "finished"
                                 rq["timestamp_finished"] = time.time()
                                 rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
+                            if os.getenv('CONTINUOUS_DEBUG','0') == '1':
+                                print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         self.transformers_model_manager.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
                     elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                         def on_finished(_idx, output, rq=req):
