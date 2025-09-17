@@ -16,6 +16,7 @@ from transformers import (
     MinPLogitsWarper
 )
 from lib.continuous_batcher import ContinuousBatcher
+from lib.fast_continuous_batcher import FastContinuousBatcher
 
 class Sampling:
     def __init__(self, seed: int, device: str = "cpu"):
@@ -126,16 +127,26 @@ class TransformersModelManager:
 
         # Continuous batcher disabled by default
         self.continuous_batcher: ContinuousBatcher | None = None
+        self.fast_continuous_batcher: FastContinuousBatcher | None = None
 
-    def enable_continuous(self, max_active: int | None = None):
-        if self.continuous_batcher is None:
-            self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
-        return self.continuous_batcher
+    def enable_continuous(self, max_active: int | None = None, use_fast: bool = True):
+        if use_fast:
+            if self.fast_continuous_batcher is None:
+                self.fast_continuous_batcher = FastContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+            return self.fast_continuous_batcher
+        else:
+            if self.continuous_batcher is None:
+                self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+            return self.continuous_batcher
 
     def submit_continuous(self, messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=False, forced_tokens=None):
-        if self.continuous_batcher is None:
+        # Try fast batcher first, fallback to regular continuous batcher
+        if self.fast_continuous_batcher is not None:
+            return self.fast_continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
+        elif self.continuous_batcher is not None:
+            return self.continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
+        else:
             raise RuntimeError("Continuous batching not enabled. Call enable_continuous() first.")
-        return self.continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
 
     def switch_model(self, model_name: str):
         if model_name != self.model_name:

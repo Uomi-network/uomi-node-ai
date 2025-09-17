@@ -57,7 +57,10 @@ class RunnerExecutor:
         else:
             # Single DeepSeek transformers model always resident (enable continuous batching)
             self.transformers_model_manager = TransformersModelManager(DEEPSEEK_MODEL_CONFIG)
-            self.transformers_model_manager.enable_continuous(max_active=BATCH_MAX_SIZE)
+            # Use fast continuous batcher by default, but allow override with FAST_CONTINUOUS_BATCHER=0
+            use_fast = os.getenv("FAST_CONTINUOUS_BATCHER", "1") == "1"
+            self.transformers_model_manager.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+            print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled")
             # self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
