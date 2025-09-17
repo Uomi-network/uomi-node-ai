@@ -2,7 +2,7 @@ import time
 import threading
 import uuid
 import os
-from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE
+from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MAX_TOKENS
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
 from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
@@ -118,10 +118,10 @@ class RunnerExecutor:
                         # Determine max_new_tokens with safe cap (env var MAX_NEW_TOKENS, default 128)
                         req_max_new = req["request"].get("max_new_tokens") or payload.get("max_new_tokens")
                         try:
-                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", "4096"))
+                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", f"{TRANSFORMERS_INFERENCE_MAX_TOKENS}"))
                         except Exception:
-                            max_new_tokens = 128
-                        max_new_tokens = max(1, min(max_new_tokens, 1024))  # hard cap to protect CPU/GPU
+                            max_new_tokens = TRANSFORMERS_INFERENCE_MAX_TOKENS
+                        max_new_tokens = max(1, min(max_new_tokens, 4096))  # hard cap to protect CPU/GPU
                         if is_check:
                             # unzip proof
                             from lib.zipper import unzip_string
