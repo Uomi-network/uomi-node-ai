@@ -103,7 +103,7 @@ class TGIClient:
         e controlla, token dopo token, che gli id generati corrispondano alla sequenza
         `forced_tokens`. Se c'è una discrepanza la verifica fallisce.
         """
-        print(f"🔍 PROOF VERIFICATION: Checking {len(forced_tokens)} tokens against TGI stream")
+        # print(f"🔍 PROOF VERIFICATION: Checking {len(forced_tokens)} tokens against TGI stream")
 
         # Prepare TGI request from messages and parameters
         tgi_request = self._prepare_tgi_request(messages, parameters or {})
@@ -633,7 +633,7 @@ class TGIClient:
             tokens = []
             generated_text = ""
             
-            print(f"🔍 Starting TGI generation with proof data collection")
+            # print(f"🔍 Starting TGI generation with proof data collection")
             
             for line in response.iter_lines():
                 if line:
@@ -648,7 +648,7 @@ class TGIClient:
                                 token_text = token_info.get('text', '')
                                 token_logprob = token_info.get('logprob', 0.0)
                                 
-                                print(f"🔍 Generated token {len(tokens)+1}: id={token_id}, text='{token_text}'")
+                                # print(f"🔍 Generated token {len(tokens)+1}: id={token_id}, text='{token_text}'")
                                 
                                 # Aggiunge alla lista dei token con proof data
                                 token_data = {
@@ -662,7 +662,7 @@ class TGIClient:
                                 if 'top_tokens' in data:
                                     token_data["top_tokens"] = data['top_tokens']
                                     top_token_ids = [t.get('id') for t in data['top_tokens']]
-                                    print(f"🔍 Position {len(tokens)+1}: chosen token {token_id}, alternatives: {top_token_ids}")
+                                    # print(f"🔍 Position {len(tokens)+1}: chosen token {token_id}, alternatives: {top_token_ids}")
                                 
                                 tokens.append(token_data)
                                 generated_text += token_text
@@ -701,7 +701,7 @@ class TGIClient:
                 "params": effective_params
             }
             
-            print(f"✅ Generation completed: {len(tokens)} tokens with proof data")
+            # print(f"✅ Generation completed: {len(tokens)} tokens with proof data")
             
             # Callback di completamento
             if on_complete:
