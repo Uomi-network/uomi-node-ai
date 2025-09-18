@@ -22,8 +22,8 @@ print('|' * 50)
 print(' ')
 
 system = System()
-# sys.exit(0) if not system.check_system_requirements() else 1
-# sys.exit(0) if not system.check_cuda_availability() else 1
+sys.exit(0) if not system.check_system_requirements() else 1
+sys.exit(0) if not system.check_cuda_availability() else 1
 system.setup_environment_variables()
 print('🚀 System setup completed!')
 print('\n')
@@ -96,13 +96,13 @@ def run_json():
     global app_cache
     time_start = time.time()
 
-    print('💬 Received request...')
+    # print('💬 Received request...')
     data = request.get_json()
 
     # Check if the response can be returned from cache
     body_hash = None
     if CACHE_ENABLED:
-        print('💬 Checking response on cache...')
+        # print('💬 Checking response on cache...')
         body_hash = hash(str(data))
         if body_hash in app_cache:
             response_cached = app_cache[body_hash]
@@ -148,7 +148,7 @@ def run_json():
     input_data["enable_thinking"] = enable_thinking
     
     if use_tgi:
-        print('💬 Processing with TGI...')
+        # print('💬 Processing with TGI...')
         # Direct processing with TGI (no queue needed)
         try:
             # Extract messages from input_data
@@ -175,7 +175,7 @@ def run_json():
             forced_tokens = None
             is_check = "proof" in data
             if is_check:
-                print('💬 TGI proof checking mode...')
+                # print('💬 TGI proof checking mode...')
                 try:
                     proof_obj = json.loads(unzip_string(data["proof"]))
                     forced_tokens = [t["id"] for t in proof_obj["tokens"]]
@@ -236,17 +236,17 @@ def run_json():
             return jsonify({"error": f"TGI processing error: {e}"}), 500
     
     else:
-        print('💬 Processing with local models...')
+        # print('💬 Processing with local models...')
         # Convert back to string format for internal processing
         data["input"] = json.dumps(input_data)
         
         # Add request to queue
-        print('💬 Adding request to queue...')
+        # print('💬 Adding request to queue...')
         request_uuid = runner_queue.add_request(data)
-        print('💬 Request added to queue with UUID ' + str(request_uuid))
+        # print('💬 Request added to queue with UUID ' + str(request_uuid))
 
         # Wait for the request to be processed (with timeout)
-        print('💬 Waiting for request to be processed...')
+        # print('💬 Waiting for request to be processed...')
         deadline = time.time() + float(os.getenv('REQUEST_TIMEOUT_SECONDS', '3600'))
         last_log = 0
         while True:
@@ -255,7 +255,7 @@ def run_json():
                 print('❌ Request disappeared from queue unexpectedly')
                 return jsonify({"error": "Internal queue error"}), 500
             if request_data["status"] == "finished":
-                print('💬 Request finished!')
+                # print('💬 Request finished!')
                 output = request_data["output"]
                 runner_queue.remove_request(request_uuid)
                 break
@@ -263,19 +263,19 @@ def run_json():
                 print('❌ Request timed out')
                 return jsonify({"error": "Request timed out"}), 504
             if time.time() - last_log > 5:
-                print(f"⏳ Still waiting... status={request_data['status']} id={request_uuid}")
+                # print(f"⏳ Still waiting... status={request_data['status']} id={request_uuid}")
                 last_log = time.time()
             time.sleep(0.1)
 
     # Check if output is valid
-    print('💬 Checking output...')
+    # print('💬 Checking output...')
     if output == None or not output["result"]:
         print('❌ Invalid output')
         return jsonify({"error": output["error"] if output != None else "Invalid output"}), 400
     
     # Store output in cache
     if CACHE_ENABLED:
-        print('💬 Storing response in cache...')
+        # print('💬 Storing response in cache...')
         app_cache[body_hash] = {
             "output": output,
             "timestamp": time.time()
@@ -348,7 +348,7 @@ def run_json():
         request_history.pop(0)
 
     # Return response
-    print('✅ Returning response in ' + str(time.time() - time_start) + ' seconds')
+    # print('✅ Returning response in ' + str(time.time() - time_start) + ' seconds')
     return jsonify(output)
 
 # MONITORING API
