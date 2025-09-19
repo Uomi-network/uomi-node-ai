@@ -1,11 +1,12 @@
 import time
 import threading
 import uuid
-from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE
+import os
+from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MAX_TOKENS
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
-from lib.TransformersModelManager import TRANSFORMERS_MODEL_CONFIG, TransformersModelManager
-from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
+from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
+# from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
 class RunnerQueue:
     def __init__(self):
@@ -47,13 +48,20 @@ class RunnerExecutor:
         print('Initialize RunnerExecutor')
         self.kill = False
         self.queue = queue
+        # Micro-batching accumulation window in milliseconds (set 0 to disable)
+        self.microbatch_window_ms = 30
         self.test_model_manager = TestModelManager(TEST_MODEL_CONFIG)
         if test_mode:
             self.transformers_model_manager = None
             self.sana_model_manager = None
         else:
-            self.transformers_model_manager = TransformersModelManager(TRANSFORMERS_MODEL_CONFIG)
-            self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
+            # Single DeepSeek transformers model always resident (enable continuous batching)
+            self.transformers_model_manager = TransformersModelManager(DEEPSEEK_MODEL_CONFIG)
+            # Use fast continuous batcher by default, but allow override with FAST_CONTINUOUS_BATCHER=0
+            use_fast = os.getenv("FAST_CONTINUOUS_BATCHER", "1") == "1"
+            self.transformers_model_manager.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+            print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled")
+            # self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
         self.thread.start()
@@ -69,111 +77,95 @@ class RunnerExecutor:
         chat_executor = ChatExecutor()
         image_executor = ImageExecutor()
         while not self.kill:
-            # Step 1: Get batch to process (minimal lock time)
-            batch = []
-            model = None
-            is_check = None
-            
+            # Poll pending requests and immediately dispatch individually to appropriate backend
+            dispatched = False
             with self.lock:
-                pending_requests = [request for request in self.queue.get_requests().values() if request["status"] == "pending"]
-                if len(pending_requests) == 0:
-                    pass  # Will sleep outside lock
-                else:
-                    # Sort pending_requests by timestamp_pending
-                    pending_requests = sorted(pending_requests, key=lambda x: x["timestamp_pending"])
-                    # Take the model and is_check of the first request
-                    model = pending_requests[0]["request"]["model"]
-
-                    if model not in TEST_MODEL_CONFIG and model not in TRANSFORMERS_MODEL_CONFIG and model not in SANA_MODEL_CONFIG:
-                        # fallback to deepseek an agent sent something from an older version of the pallet. Could happen if not all validators updated yet.
-                        model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-                        pending_requests[0]["request"]["model"] = model
-                        # TODO: remove this fallback when all validators are updated to the latest pallet version
-
-                    is_check = True if "proof" in pending_requests[0]["request"] else False
-                    # Generate the batch by taking the first BATCH_MAX_SIZE requests with the same model and is_check
-                    batch = [request for request in pending_requests if request["request"]["model"] == model and ("proof" in request["request"]) == is_check][:BATCH_MAX_SIZE]
-                    
-                    # Mark batch as running
-                    for request in batch:
-                        request["status"] = "running"
-                        request["timestamp_running"] = time.time()
-                        request["batch"] = [req["uuid"] for req in batch]
-            
-            # Step 2: Handle no work case (outside lock)
-            if not batch:
-                time.sleep(BATCH_WAIT_SEC)  # Sleep outside the lock
+                pending = [req for req in self.queue.get_requests().values() if req["status"] == "pending"]
+            if not pending:
+                time.sleep(BATCH_WAIT_SEC)
                 continue
-                
-            # Step 3: Process batch (outside any locks to prevent deadlock)
-            try:
-                print('🤖 Running batch with ' + str(len(batch)) + ' requests')
-                self.test_model_manager.clear_model()
-                self.transformers_model_manager.clear_model() if self.transformers_model_manager is not None else None
-                self.sana_model_manager.clear_model() if self.sana_model_manager is not None else None
-                
-                if model in TEST_MODEL_CONFIG:
-                    self.test_model_manager.switch_model(model)
-                    def on_output_finished(index, output):
-                        # Use minimal lock for status update only
-                        if index < len(batch):
-                            with self.lock:
-                                batch[index]["status"] = "finished"
-                                batch[index]["timestamp_finished"] = time.time()
-                                batch[index]["output"] = output
-                    if is_check:
-                        chat_executor.check([request["request"]["input"] for request in batch], [request["request"]["proof"] for request in batch], self.test_model_manager, on_output_finished)
-                    else:
-                        chat_executor.execute([request["request"]["input"] for request in batch], self.test_model_manager, on_output_finished)
-                    self.test_model_manager.clear_model()
-                elif model in TRANSFORMERS_MODEL_CONFIG and self.transformers_model_manager is not None:
-                    self.transformers_model_manager.switch_model(model)
-                    def on_output_finished(index, output):
-                        # Use minimal lock for status update only
-                        if index < len(batch):
-                            with self.lock:
-                                batch[index]["status"] = "finished"
-                                batch[index]["timestamp_finished"] = time.time()
-                                batch[index]["output"] = output
-                    if is_check:
-                        chat_executor.check([request["request"]["input"] for request in batch], [request["request"]["proof"] for request in batch], self.transformers_model_manager, on_output_finished)
-                    else:
-                        chat_executor.execute([request["request"]["input"] for request in batch], self.transformers_model_manager, on_output_finished)
-                    keep_in_memory = TRANSFORMERS_MODEL_CONFIG[model].keep_in_memory if model in TRANSFORMERS_MODEL_CONFIG else False
-                    if not keep_in_memory:
-                        self.transformers_model_manager.clear_model()
-                elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
-                    self.sana_model_manager.switch_model(model)
-                    def on_output_finished(index, output):
-                        # Use minimal lock for status update only
-                        if index < len(batch):
-                            with self.lock:
-                                batch[index]["status"] = "finished"
-                                batch[index]["timestamp_finished"] = time.time()
-                                batch[index]["output"] = output
-                    if is_check:
-                        # Handle unsupported check case
-                        with self.lock:
-                            for i, request in enumerate(batch):
-                                request["status"] = "finished"
-                                request["timestamp_finished"] = time.time()
-                                request["output"] = {"result": False, "error": "Check not supported for the requested model"}
-                    else:
-                        image_executor.execute([request["request"]["input"] for request in batch], self.sana_model_manager, on_output_finished)
-                    self.sana_model_manager.clear_model()
-                else:
-                    # Handle invalid model case
-                    with self.lock:
-                        for i, request in enumerate(batch):
-                            request["status"] = "finished"
-                            request["timestamp_finished"] = time.time()
-                            request["output"] = {"result": False, "error": "Model not valid"}
-            except Exception as e:
-                # Handle exceptions and mark batch as failed
-                print(f"Error processing batch: {e}")
+            for req in sorted(pending, key=lambda r: r["timestamp_pending"]):
+                model = req["request"].get("model")
+                if model not in TEST_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
+                    model = DEEPSEEK_MODEL_CONFIG.model_name
+                    req["request"]["model"] = model
+                is_check = "proof" in req["request"]
+                # Mark running
                 with self.lock:
-                    for request in batch:
-                        request["status"] = "finished"
-                        request["timestamp_finished"] = time.time()
-                        request["output"] = {"result": False, "error": f"Processing error: {str(e)}"}
+                    if req["status"] != "pending":
+                        continue
+                    req["status"] = "running"
+                    req["timestamp_running"] = time.time()
+                try:
+                    if model in TEST_MODEL_CONFIG:
+                        # Use legacy batch path but one-at-a-time
+                        def on_finished(_idx, output, rq=req):
+                            with self.lock:
+                                rq["status"] = "finished"
+                                rq["timestamp_finished"] = time.time()
+                                rq["output"] = output
+                        if is_check:
+                            ChatExecutor().check([req["request"]["input"]],[req["request"]["proof"]], self.test_model_manager, on_finished)
+                        else:
+                            ChatExecutor().execute([req["request"]["input"]], self.test_model_manager, on_finished)
+                    elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_manager is not None:
+                        # Continuous submission
+                        print(f"🟢 Dispatching transformers request {req['uuid']}")
+                        input_json = req["request"]["input"]
+                        import json
+                        payload = json.loads(input_json)
+                        messages = payload["messages"]
+                        enable_thinking = payload.get("enable_thinking", True)
+                        # Allow optional per-request sampling / max tokens overrides
+                        sampling_cfg = payload.get("sampling", {"temperature":0.7, "top_k":5})
+                        # Determine max_new_tokens with safe cap (env var MAX_NEW_TOKENS, default 128)
+                        req_max_new = req["request"].get("max_new_tokens") or payload.get("max_new_tokens")
+                        try:
+                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", f"{TRANSFORMERS_INFERENCE_MAX_TOKENS}"))
+                        except Exception:
+                            max_new_tokens = TRANSFORMERS_INFERENCE_MAX_TOKENS
+                        max_new_tokens = max(1, min(max_new_tokens, 4096))  # hard cap to protect CPU/GPU
+                        if is_check:
+                            # unzip proof
+                            from lib.zipper import unzip_string
+                            proof_obj = json.loads(unzip_string(req["request"]["proof"]))
+                            forced_ids = [t["id"] for t in proof_obj["tokens"]]
+                            # In check mode, limit generation exactly to proof length
+                            max_new_tokens = len(forced_ids)
+                        else:
+                            forced_ids = None
+                        def on_token(sid, txt, meta, rq=req):
+                            if os.getenv('CONTINUOUS_DEBUG','0') == '1':
+                                print(f"[stream] req={rq['uuid']} sid={sid[:6]} token={meta.get('id')} txt='{txt}'")
+                        def on_complete(sid, response, proof, rq=req):
+                            from lib.zipper import zip_string
+                            import json as _j
+                            wrapped_proof = zip_string(_j.dumps(proof)) if proof is not None else ""
+                            with self.lock:
+                                rq["status"] = "finished"
+                                rq["timestamp_finished"] = time.time()
+                                rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
+                            if os.getenv('CONTINUOUS_DEBUG','0') == '1':
+                                print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
+                        self.transformers_model_manager.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
+                    # elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
+                    #     def on_finished(_idx, output, rq=req):
+                    #         with self.lock:
+                    #             rq["status"] = "finished"
+                    #             rq["timestamp_finished"] = time.time()
+                    #             rq["output"] = output
+                    #     ImageExecutor().execute([req["request"]["input"]], self.sana_model_manager, on_finished)
+                    else:
+                        with self.lock:
+                            req["status"] = "finished"
+                            req["timestamp_finished"] = time.time()
+                            req["output"] = {"result": False, "error": "Model not valid"}
+                    dispatched = True
+                except Exception as e:
+                    with self.lock:
+                        req["status"] = "finished"
+                        req["timestamp_finished"] = time.time()
+                        req["output"] = {"result": False, "error": f"Processing error: {e}"}
+            if not dispatched:
+                time.sleep(BATCH_WAIT_SEC)
 

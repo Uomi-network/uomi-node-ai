@@ -1,19 +1,19 @@
 import torch
 import time
+import os
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
-import torch
-import time
-
 from transformers import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     MinPLogitsWarper
 )
+from lib.continuous_batcher import ContinuousBatcher
+from lib.fast_continuous_batcher import FastContinuousBatcher
 
 class Sampling:
     def __init__(self, seed: int, device: str = "cpu"):
@@ -38,145 +38,138 @@ class TransformersModelConfig:
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
 
 class TransformersModelManager:
-    def __init__(self, models_config: Dict[str, TransformersModelConfig]):
-        """
-        Initialize TransformersModelManager with multiple transformer models loaded on CPU.
-        
-        Args:
-            models_config: Dictionary mapping model names to their configurations
-        """
-        self.models_config = models_config
-        self.cpu_models = {}
-        self.tokenizers = {}
-        self.current_gpu_model = None
-        self.current_gpu_model_name = None
-        self.seed = 42  # Seed for deterministic behavior
-        self.device = 'cuda'
+    def __init__(self, model_config: TransformersModelConfig):
+        """Single-model manager (DeepSeek only) kept always on GPU (or CPU if CUDA unavailable)."""
+        self.model_config = model_config
+        self.model_name = model_config.model_name
+        self.seed = 42
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         self.warpers = [
             TemperatureLogitsWarper(TRANSFORMERS_INFERENCE_TEMPERATURE),
             TopKLogitsWarper(top_k=5)
         ]
-        
-        # Load all models and tokenizers on CPU
-        for model_name, config in models_config.items():
-            # Load tokenizer
-            print(f"Loading tokenizer for model {model_name}")
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name,
-                **config.tokenizer_kwargs
+
+        # Load tokenizer
+        print(f"Loading tokenizer for model {self.model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_config.model_name,
+            **self.model_config.tokenizer_kwargs
+        )
+        # Ensure pad token and left padding for decoder-only models (eliminates right-padding warning)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = 'left'
+        if self.model_config.tokenizer_kwargs.get("chat_template") is not None:
+            self.tokenizer.chat_template = self.model_config.tokenizer_kwargs["chat_template"]
+
+        # Load model
+        print(f"Loading model {self.model_name} to device {self.device}")
+        load_dtype = torch.float16 if self.device == 'cuda' else torch.float32
+        # Allow overriding attention implementation / device map / max memory via env without code change
+        # ATTN_IMPL example: flash_attention_2 (if supported by installed transformers version)
+        attn_impl = os.getenv("ATTN_IMPL")
+        if attn_impl:
+            # do not overwrite if user already passed something explicitly
+            self.model_config.model_kwargs.setdefault("attn_implementation", attn_impl)
+
+        # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
+        max_memory_env = os.getenv("MAX_MEMORY")
+        max_memory = None
+        if max_memory_env:
+            try:
+                max_memory = {}
+                for part in max_memory_env.split(','):
+                    gid, cap = part.split(':', 1)
+                    max_memory[int(gid.strip())] = cap.strip()
+            except Exception as e:
+                print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
+                max_memory = None
+
+        device_map_env = os.getenv("DEVICE_MAP", "auto")
+        try:
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map=device_map_env,
+                max_memory=max_memory,
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                **self.model_config.model_kwargs
             )
-            if config.tokenizer_kwargs.get("chat_template") is not None:
-                tokenizer.chat_template = config.tokenizer_kwargs["chat_template"]
-            self.tokenizers[model_name] = tokenizer
-            
-            # Load model on CPU
-            if config.location == "cpu":
-                print(f"Loading model {model_name} on CPU")
-                model = AutoModelForCausalLM.from_pretrained(
-                    config.model_name,
-                    # attn_implementation="flash_attention_2",
-                    device_map="cpu",
-                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    cache_dir=MODELS_FOLDER,
-                    **config.model_kwargs
-                )
-                # Pin memory for faster GPU transfer
-                for param in model.parameters():
-                    param.data.pin_memory()
-                for buffer in model.buffers():
-                    buffer.data.pin_memory()
+        except Exception as e:
+            print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map='auto',
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                **self.model_config.model_kwargs
+            )
+        
+        # Force model to GPU if it ended up on CPU despite CUDA availability
+        model_device = next(self.current_gpu_model.parameters()).device
+        if str(model_device) == 'cpu' and self.device == 'cuda':
+            print(f"[model-load] Moving model from CPU to {self.device}")
+            try:
+                self.current_gpu_model = self.current_gpu_model.to(self.device)
+                print(f"[model-load] Successfully moved model to {self.device}")
+            except Exception as e:
+                print(f"[model-load] Failed to move model to GPU: {e}")
+                self.device = 'cpu'  # Fallback to CPU
 
-                # Try a switch
-                self.cpu_models[model_name] = model
-                self.switch_model(model_name)
-                self.clear_model()
-            
-            # Load model from disk to gpu, then clear it
-            elif config.location == "disk":
-                print(f"Loading model {model_name} from disk to GPU")
-                self.current_gpu_model_name = model_name
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    config.model_name,
-                    device_map="cuda",
-                    # attn_implementation="flash_attention_2",
-                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    cache_dir=MODELS_FOLDER,
-                    **config.model_kwargs
-                )
-                self.clear_model()
+        # Optional torch.compile acceleration
+        if os.getenv("TORCH_COMPILE", "0") == "1":
+            compile_mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
+            try:
+                self.current_gpu_model = torch.compile(self.current_gpu_model, mode=compile_mode, fullgraph=False)
+                print(f"[compile] Enabled torch.compile mode={compile_mode}")
+            except Exception as e:
+                print(f"[compile] Skipped torch.compile: {e}")
 
-            # Error if location is not cpu or disk
-            else:
-                raise ValueError(f"Invalid location {config.location} for model {model_name}")
+        # Report resolved device map for observability
+        if hasattr(self.current_gpu_model, 'hf_device_map'):
+            print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
+        
+        # Report actual model device placement
+        model_device = next(self.current_gpu_model.parameters()).device
+        print(f"[model-load] Model loaded on device: {model_device}")
+        
+        if self.device == 'cpu':
+            print("CUDA not available, model loaded on CPU")
+        elif str(model_device) == 'cpu' and self.device == 'cuda':
+            print("⚠️  WARNING: Model ended up on CPU despite CUDA being available!")
+            print("⚠️  This will cause 0% GPU utilization!")
+
+        # Continuous batcher disabled by default
+        self.continuous_batcher: ContinuousBatcher | None = None
+        self.fast_continuous_batcher: FastContinuousBatcher | None = None
+
+    def enable_continuous(self, max_active: int | None = None, use_fast: bool = True):
+        if use_fast:
+            if self.fast_continuous_batcher is None:
+                self.fast_continuous_batcher = FastContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+            return self.fast_continuous_batcher
+        else:
+            if self.continuous_batcher is None:
+                self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+            return self.continuous_batcher
+
+    def submit_continuous(self, messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=False, forced_tokens=None):
+        # Try fast batcher first, fallback to regular continuous batcher
+        if self.fast_continuous_batcher is not None:
+            return self.fast_continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
+        elif self.continuous_batcher is not None:
+            return self.continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
+        else:
+            raise RuntimeError("Continuous batching not enabled. Call enable_continuous() first.")
 
     def switch_model(self, model_name: str):
-        """
-        Switch the model on GPU to a different one.
-        
-        Args:
-            model_name: Name of the model to switch to
-            
-        Returns:
-            The model that is now on GPU
-        """
-        time_start = time.time()
-
-        # Load model configuration
-        if model_name not in self.models_config:
-            raise KeyError(f"Model {model_name} not found in configured models")
-        model_config = self.models_config[model_name]
-
-        # Clear existing GPU model if present
-        self.clear_model()
-        
-        # Move new model to GPU from CPU
-        if model_config.location == "cpu":
-            self.current_gpu_model = self.cpu_models[model_name].to("cuda")
-            self.current_gpu_model_name = model_name
-
-            torch.cuda.synchronize()  # Synchronize CUDA operations
-        
-        # Load model from disk to GPU
-        elif model_config.location == "disk":
-            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                model_config.model_name,
-                device_map="cuda",
-                torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                cache_dir=MODELS_FOLDER,
-                # attn_implementation="flash_attention_2",
-                **model_config.model_kwargs
-            )
-            self.current_gpu_model_name = model_name
-        
-        # Error if location is not cpu or disk
-        else:
-            raise ValueError(f"Invalid location {model_config.location} for model {model_name}")
-
-        print(f"Time taken to switch model: {time.time() - time_start:.2f}s")
+        if model_name != self.model_name:
+            raise ValueError("Switching models not supported; single model manager.")
         return self.current_gpu_model
 
     def clear_model(self):
-        """
-        Remove the current model from GPU if one exists.
-        """
-        time_start = time.time()
-        if self.current_gpu_model is not None:
-            if self.models_config[self.current_gpu_model_name].location == "cpu":
-                # Move model back to CPU
-                self.cpu_models[self.current_gpu_model_name] = self.current_gpu_model.to("cpu")
-
-            # Clear GPU model references
-            self.current_gpu_model = None
-            self.current_gpu_model_name = None
-            
-            # Clear CUDA cache
-            torch.cuda.empty_cache()
-
-            # Ensure all CUDA operations are finished
-            torch.cuda.synchronize()
-
-        print(f"Time taken to clear model for TRANSFORMERS MODEL MANAGER: {time.time() - time_start:.2f}s")
+        return  # no-op to preserve interface
 
     def run_batch_executions(self, prompts, enable_thinking_list, on_prompt_finished):
         """
@@ -187,14 +180,10 @@ class TransformersModelManager:
             enable_thinking_list: List of enable_thinking values for each prompt
             on_prompt_finished: Callback function to call when a prompt is finished
         """
-        if self.current_gpu_model is None:
-            print("No model loaded on GPU")
-            return None 
-    
+        # Always loaded
         start_time = time.time()
 
-        # Switch between deterministic and non-deterministic behavior
-        if self.models_config[self.current_gpu_model_name].deterministic:
+        if self.model_config.deterministic:
             torch.manual_seed(self.seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.seed)
@@ -207,8 +196,7 @@ class TransformersModelManager:
             torch.backends.cudnn.benchmark = True
             torch.use_deterministic_algorithms(False)
         
-        # Convert prompts to texts
-        tokenizer = self.tokenizers[self.current_gpu_model_name]
+        tokenizer = self.tokenizer
         
         # Ensure tokenizer has padding token
         if tokenizer.pad_token is None:
@@ -229,14 +217,17 @@ class TransformersModelManager:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             
-        # Tokenize all inputs
-        batch_input_ids = tokenizer(texts, padding=True, return_tensors="pt").input_ids.to(self.device)
+        # Tokenize all inputs (left-padded) and keep attention mask to avoid warning
+        tokenized = tokenizer(texts, padding=True, return_tensors="pt")
+        batch_input_ids = tokenized.input_ids.to(self.device)
+        attention_mask = tokenized.attention_mask.to(self.device)
         
         # Setup generation parameters
+        max_new_tokens = int(os.getenv("SMOKE_MAX_NEW_TOKENS", TRANSFORMERS_INFERENCE_MAX_TOKENS))
         generation_config = {
-            "max_new_tokens": TRANSFORMERS_INFERENCE_MAX_TOKENS,
+            "max_new_tokens": max_new_tokens,
             "temperature": TRANSFORMERS_INFERENCE_TEMPERATURE,
-            "do_sample": not self.models_config[self.current_gpu_model_name].deterministic,
+            "do_sample": not self.model_config.deterministic,
             "use_cache": USE_KV_CACHE,
             "eos_token_id": tokenizer.eos_token_id,
             "pad_token_id": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
@@ -256,8 +247,9 @@ class TransformersModelManager:
         # Run generation
         outputs = self.current_gpu_model.generate(
             batch_input_ids,
+            attention_mask=attention_mask,
             **generation_config
-        )        
+        )
         # Process results
         generated_sequences = outputs.sequences
         scores = outputs.scores
@@ -265,7 +257,8 @@ class TransformersModelManager:
         # Process each output sequence
         for i, (input_ids, generated_sequence) in enumerate(zip(batch_input_ids, generated_sequences)):
             # Get the generated text (only the new tokens, not the prompt)
-            print(f"{generated_sequences=}")
+            if i == 0 and os.getenv("DEBUG_GENERATION"):
+                print(f"generated_sequences shape={generated_sequences.shape}")
             prompt_length = len(input_ids)
             generated_tokens = generated_sequence[prompt_length:]
             
@@ -338,13 +331,11 @@ class TransformersModelManager:
             proofs: List of proofs, each containing generated token IDs (e.g., [{"id": token_id}, ...]).
             on_prompt_finished: Callback function to call with verification results.
         """
-        if self.current_gpu_model is None:
-            print("No model loaded on GPU")
-            return None
+        # Model always loaded
         start_time = time.time()
 
-        # Deterministic setup (as per your original code)
-        deterministic_config = self.models_config[self.current_gpu_model_name].deterministic
+        # Deterministic setup
+        deterministic_config = self.model_config.deterministic
         torch.manual_seed(self.seed)
         if deterministic_config:
             torch.backends.cudnn.deterministic = True
@@ -356,7 +347,7 @@ class TransformersModelManager:
             torch.use_deterministic_algorithms(False)
 
         # Access tokenizer
-        tokenizer = self.tokenizers[self.current_gpu_model_name]
+        tokenizer = self.tokenizer
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.pad_token_id
 
         # Prepare full input sequences (prompt + proof)
@@ -426,70 +417,21 @@ class TransformersModelManager:
         print(f"Batch processed in {time.time() - start_time:.2f}s")
 
     def get_current_model(self):
-        """
-        Get the currently active GPU model.
-        
-        Returns:
-            The current GPU model or None if no model is loaded
-        """
         return self.current_gpu_model
-    
-    def get_tokenizer(self, model_name: str):
-        """
-        Get the tokenizer for a specific model.
-        
-        Args:
-            model_name: Name of the model whose tokenizer to retrieve
-            
-        Returns:
-            The tokenizer for the specified model
-            
-        Raises:
-            KeyError: If model_name is not found in configured models
-        """
-        if model_name not in self.tokenizers:
-            raise KeyError(f"Tokenizer for model {model_name} not found")
-        return self.tokenizers[model_name]
+
+    def get_tokenizer(self, _model_name: str | None = None):
+        return self.tokenizer
 
 
-TRANSFORMERS_MODEL_CONFIG = {
-    # 'casperhansen/mistral-small-24b-instruct-2501-awq': TransformersModelConfig(
-    #     model_name='casperhansen/mistral-small-24b-instruct-2501-awq',
-    #     deterministic=True,
-    #     location="cpu",
-    #     model_kwargs={
-    #         "use_cache": True
-    #     },
-    #     tokenizer_kwargs={}
-    # ),
-    # 'Qwen/QwQ-32B-AWQ': TransformersModelConfig(
-    #     model_name='Qwen/QwQ-32B-AWQ',
-    #     deterministic=False,
-    #     location="cpu",
-    #     model_kwargs={
-    #         "use_cache": True
-    #     },
-    #     tokenizer_kwargs={}
-    # ),
-    'SentientAGI/Dobsby-Mini-Unhinged-Llama-3.1-8B': TransformersModelConfig(
-        model_name='SentientAGI/Dobby-Mini-Unhinged-Llama-3.1-8B',
-        deterministic=False,
-        location="disk",
-        model_kwargs={
-            "use_cache": True
-        },
-        tokenizer_kwargs={}
-    ),
-    'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B': TransformersModelConfig(
-        model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
-        deterministic=False,
-        location="cpu",
-        keep_in_memory=True,
-        model_kwargs={
-            "use_cache": True,
-        },
-        tokenizer_kwargs={
-            "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true, is_last_user=false) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{% set content = message['content'] %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{%- set ns.is_first = false -%}{%- set ns.is_last_user = true -%}{{'<｜User｜>' + content + '<｜Assistant｜>'}} {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}{%- if message['role'] == 'assistant' %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{% endif %}{%- if message['role'] == 'assistant' and message['tool_calls'] is defined and message['tool_calls'] is not none %}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{%- endif %}{%- set ns.is_first = false %}{%- set ns.is_tool = false -%}{%- set ns.is_output_first = true %}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if content is none %}{{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none)%}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + content + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_last_user = false -%}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'\n<｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_last_user and not ns.is_tool %}{{'<｜Assistant｜>'}} \n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n {% endif %}"
-        }
-    ),
+DEEPSEEK_MODEL_CONFIG = TransformersModelConfig(
+    model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
+    deterministic=False,
+    location='gpu',
+    keep_in_memory=True,
+    model_kwargs={
+        'use_cache': True,
+    },
+    tokenizer_kwargs={
+        'chat_template': "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true, is_last_user=false) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{% set content = message['content'] %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{%- set ns.is_first = false -%}{%- set ns.is_last_user = true -%}{{'<｜User｜>' + content + '<｜Assistant｜>'}} {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}{%- if message['role'] == 'assistant' %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{% endif %}{%- if message['role'] == 'assistant' and message['tool_calls'] is defined and message['tool_calls'] is not none %}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{%- endif %}{%- set ns.is_first = false %}{%- set ns.is_tool = false -%}{%- set ns.is_output_first = true %}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if content is none %}{{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{content + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none)%}{%- set ns.is_last_user = false -%}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + content + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_last_user = false -%}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'\n<｜tool▁output▁begin｜>' + content + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_last_user and not ns.is_tool %}{{'<｜Assistant｜>'}} \n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n {% endif %}"
     }
+)
