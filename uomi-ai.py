@@ -147,9 +147,14 @@ def run_json():
 
     # Check if output is valid
     print('💬 Checking output...')
-    if output == None or not output["result"]:
-        print('❌ Invalid output')
-        return jsonify({"error": output["error"] if output != None else "Invalid output"}), 400
+    if output == None:
+        print('❌ Invalid output (None)')
+        return jsonify({"error": "Invalid output"}), 400
+    if not output.get("result", False):
+        # Return the full output payload for non-success responses so callers
+        # can inspect verification diagnostics and proof fields.
+        print('❌ Verification failed; returning full output for diagnostics')
+        return jsonify(output), 400
     
     # Store output in cache
     if CACHE_ENABLED:

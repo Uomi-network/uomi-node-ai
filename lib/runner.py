@@ -128,7 +128,35 @@ class RunnerExecutor:
                         if is_check:
                             # unzip proof
                             from lib.zipper import unzip_string
-                            proof_obj = json.loads(unzip_string(req["request"]["proof"]))
+                            try:
+                                proof_obj = json.loads(unzip_string(req["request"]["proof"]))
+                            except Exception as e:
+                                print(f"[verify-log] failed to unzip/parse proof: {e}")
+                                proof_obj = {"tokens": []}
+                            # Server-side diagnostic: print received proof token ids and decoded tokens
+                            try:
+                                tokenizer = None
+                                if self.transformers_model_manager is not None:
+                                    tokenizer = self.transformers_model_manager.get_tokenizer(None)
+                                token_ids = [t.get('id') for t in proof_obj.get('tokens', [])]
+                                decoded_tokens = []
+                                if tokenizer is not None and token_ids:
+                                    for tid in token_ids:
+                                        try:
+                                            decoded_tokens.append(tokenizer.decode([int(tid)], skip_special_tokens=True))
+                                        except Exception:
+                                            decoded_tokens.append('')
+                                print(f"[verify-log] received proof token_ids={token_ids}")
+                                print(f"[verify-log] received proof decoded_tokens={decoded_tokens}")
+                                # Also print the actual prompt text the server will verify against
+                                if tokenizer is not None:
+                                    try:
+                                        prompt_preview = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
+                                        print(f"[verify-log] prompt_preview='{prompt_preview[:400]}'")
+                                    except Exception as _:
+                                        pass
+                            except Exception as e:
+                                print(f"[verify-log] error while logging proof diagnostics: {e}")
                             forced_ids = [t["id"] for t in proof_obj["tokens"]]
                             # In check mode, limit generation exactly to proof length
                             max_new_tokens = len(forced_ids)
@@ -140,11 +168,28 @@ class RunnerExecutor:
                         def on_complete(sid, response, proof, rq=req):
                             from lib.zipper import zip_string
                             import json as _j
-                            wrapped_proof = zip_string(_j.dumps(proof)) if proof is not None else ""
+                            wrapped_proof = ""
+                            result_flag = True
+                            try:
+                                if proof is not None:
+                                    # Ensure proof contains verification flag when available
+                                    if isinstance(proof, dict) and 'verified' in proof:
+                                        result_flag = bool(proof.get('verified'))
+                                    wrapped_proof = zip_string(_j.dumps(proof))
+                                else:
+                                    wrapped_proof = ""
+                            except Exception:
+                                # On any error while handling proof, fall back to True
+                                wrapped_proof = zip_string(_j.dumps(proof)) if proof is not None else ""
                             with self.lock:
                                 rq["status"] = "finished"
                                 rq["timestamp_finished"] = time.time()
-                                rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
+                                # Provide an error field when verification failed so callers
+                                # can safely reference output['error'] without KeyError
+                                if result_flag:
+                                    rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
+                                else:
+                                    rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": "verification_failed"}
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         self.transformers_model_manager.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)

@@ -155,6 +155,37 @@ class TransformersModelManager:
             return self.continuous_batcher
 
     def submit_continuous(self, messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=False, forced_tokens=None):
+        # If this is a verification (check) request, run the dedicated batch-check path
+        # The fast continuous batcher currently ignores `is_check/forced_tokens`, so
+        # dispatch checks to `run_batch_checks` which performs a single forward pass
+        # and verifies the provided proof tokens.
+        if is_check:
+            import uuid
+            # Build proof structure expected by run_batch_checks: list of {'tokens': [{'id': ...}, ...]}
+            proof_obj = {'tokens': []}
+            if forced_tokens is not None:
+                for tid in forced_tokens:
+                    proof_obj['tokens'].append({'id': int(tid)})
+
+            # Wrap on_complete to match run_batch_checks' on_prompt_finished signature
+            def _on_prompt_finished(idx, output):
+                # run_batch_checks returns {'response': str, 'proof': None} for verified
+                # Call original on_complete with a generated sid and the output
+                sid = uuid.uuid4().hex
+                resp = output.get('response', '')
+                pf = output.get('proof', None)
+                on_complete(sid, resp, pf)
+
+            # run_batch_checks expects lists for prompts/enable_thinking/proofs
+            prompts = [messages]
+            enables = [enable_thinking]
+            proofs = [proof_obj]
+            # Execute verification synchronously (single-batch)
+            self.run_batch_checks(prompts, enables, proofs, _on_prompt_finished)
+            # Return a synthetic sid to maintain interface compatibility
+            import uuid as _u
+            return _u.uuid4().hex
+
         # Try fast batcher first, fallback to regular continuous batcher
         if self.fast_continuous_batcher is not None:
             return self.fast_continuous_batcher.submit(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_tokens)
@@ -331,6 +362,11 @@ class TransformersModelManager:
             proofs: List of proofs, each containing generated token IDs (e.g., [{"id": token_id}, ...]).
             on_prompt_finished: Callback function to call with verification results.
         """
+
+        print("Running batch checks...")
+        print("Proofs:", proofs)
+        print("Prompts:", prompts)
+
         # Model always loaded
         start_time = time.time()
 
@@ -389,20 +425,48 @@ class TransformersModelManager:
             logits = outputs.logits  # Shape: [batch_size, max_len, vocab_size]
 
         # Verify each generated token
+        verbose = os.getenv('VERBOSE_VERIFY', '1') == '1'
         for batch_idx, (prompt_len, proof) in enumerate(zip(prompt_lengths, proofs)):
             generated_len = len(proof["tokens"])
             valid = True
+            diagnostics = []
             # Check each token in the generated sequence
             for i in range(generated_len):
                 # Position j predicts the token at j+1
                 j = prompt_len - 1 + i
                 if j >= max_len - 1:
-                    break  # Beyond sequence length due to padding
-                current_logits = logits[batch_idx, j, :]  # Logits for next token
-                top_tokens = torch.topk(current_logits, 10).indices  # Top 10 token IDs
-                next_token = full_input_ids[batch_idx][j + 1].item()  # Actual next token
-                if next_token not in top_tokens:
+                    # Out-of-range due to padding; break and mark invalid
                     valid = False
+                    diagnostics.append({'pos': i, 'reason': 'padding_truncation'})
+                    break
+                current_logits = logits[batch_idx, j, :]  # Logits for next token
+                topk = torch.topk(current_logits, 10)
+                top_tokens = topk.indices
+                top_probs = torch.nn.functional.softmax(topk.values, dim=-1)
+                next_token = full_input_ids[batch_idx][j + 1].item()  # Actual next token
+                in_topk = int(next_token in top_tokens)
+                if not in_topk:
+                    valid = False
+                if verbose:
+                    # Build readable diagnostics for this token
+                    top_list = []
+                    for rank, tid in enumerate(top_tokens.tolist()):
+                        try:
+                            txt = tokenizer.decode([tid], skip_special_tokens=True)
+                        except Exception:
+                            txt = ''
+                        prob_val = float(top_probs[rank].item()) if rank < len(top_probs) else None
+                        top_list.append({'rank': rank, 'id': int(tid), 'prob': prob_val, 'text': txt})
+                    try:
+                        next_text = tokenizer.decode([next_token], skip_special_tokens=True)
+                    except Exception:
+                        next_text = ''
+                    diagnostics.append({'pos': i, 'next_token': int(next_token), 'next_text': next_text, 'in_topk': bool(in_topk), 'top': top_list})
+                else:
+                    if not in_topk:
+                        diagnostics.append({'pos': i, 'next_token': int(next_token), 'in_topk': False})
+                if not in_topk:
+                    # stop at first mismatch
                     break
 
             # Prepare response based on verification
@@ -410,9 +474,22 @@ class TransformersModelManager:
                 # Decode the verified generated sequence
                 generated_ids = full_input_ids[batch_idx][prompt_len:prompt_len + generated_len]
                 response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                on_prompt_finished(batch_idx, {"response": response, "proof": None})
+                out_proof = {
+                    'tokens': proof['tokens'],
+                    'full_sequence_length': prompt_len + generated_len,
+                    'verified': True,
+                }
+                if diagnostics:
+                    out_proof['diagnostics'] = diagnostics
+                on_prompt_finished(batch_idx, {"response": response, "proof": out_proof})
             else:
-                on_prompt_finished(batch_idx, {"response": "", "proof": None})
+                out_proof = {
+                    'tokens': proof['tokens'],
+                    'full_sequence_length': prompt_len + generated_len,
+                    'verified': False,
+                    'diagnostics': diagnostics
+                }
+                on_prompt_finished(batch_idx, {"response": "", "proof": out_proof})
 
         print(f"Batch processed in {time.time() - start_time:.2f}s")
 
@@ -424,7 +501,7 @@ class TransformersModelManager:
 
 
 DEEPSEEK_MODEL_CONFIG = TransformersModelConfig(
-    model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
+    model_name='meta-llama/Llama-3.2-1B',
     deterministic=False,
     location='gpu',
     keep_in_memory=True,
