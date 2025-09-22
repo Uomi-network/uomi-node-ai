@@ -501,7 +501,7 @@ class TransformersModelManager:
 
 
 DEEPSEEK_MODEL_CONFIG = TransformersModelConfig(
-    model_name='meta-llama/Llama-3.2-1B',
+    model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
     deterministic=False,
     location='gpu',
     keep_in_memory=True,
