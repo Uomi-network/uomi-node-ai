@@ -124,7 +124,7 @@ class RunnerExecutor:
                             max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", f"{TRANSFORMERS_INFERENCE_MAX_TOKENS}"))
                         except Exception:
                             max_new_tokens = TRANSFORMERS_INFERENCE_MAX_TOKENS
-                        max_new_tokens = max(1, min(max_new_tokens, 4096))  # hard cap to protect CPU/GPU
+                        max_new_tokens = max(1, min(max_new_tokens, TRANSFORMERS_INFERENCE_MAX_TOKENS))  # hard cap to protect CPU/GPU
                         if is_check:
                             # unzip proof
                             from lib.zipper import unzip_string
