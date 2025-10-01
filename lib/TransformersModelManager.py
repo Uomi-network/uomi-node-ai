@@ -100,10 +100,6 @@ class TransformersModelManager:
 
         device_map_env = os.getenv("DEVICE_MAP", "auto")
         print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-
-        # Track whether we're using device_map
-        using_device_map = (device_map_env is not None and device_map_env != "")
-
         try:
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
@@ -118,15 +114,13 @@ class TransformersModelManager:
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
                 device_map='auto',
-                max_memory=max_memory,
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
                 **self.model_config.model_kwargs
             )
-            using_device_map = True
-
-        # NEVER call .to() when using device_map - it destroys multi-GPU distribution
-        if not using_device_map:
+        
+        # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
+        if not hasattr(self.current_gpu_model, 'hf_device_map'):
             model_device = next(self.current_gpu_model.parameters()).device
             if str(model_device) == 'cpu' and self.device == 'cuda':
                 print(f"[model-load] Moving model from CPU to {self.device}")
@@ -137,7 +131,7 @@ class TransformersModelManager:
                     print(f"[model-load] Failed to move model to GPU: {e}")
                     self.device = 'cpu'  # Fallback to CPU
         else:
-            print(f"[model-load] Skipping .to() - using device_map for multi-GPU distribution")
+            print(f"[model-load] Skipping .to() - model already distributed via device_map")
 
         # Optional torch.compile acceleration
         if os.getenv("TORCH_COMPILE", "0") == "1":
