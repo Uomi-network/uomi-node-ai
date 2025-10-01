@@ -98,7 +98,6 @@ class TransformersModelManager:
         try:
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
-                device='cuda',
                 device_map=device_map_env,
                 max_memory=max_memory,
                 torch_dtype=load_dtype,
@@ -109,7 +108,6 @@ class TransformersModelManager:
             print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
-                device='cuda',
                 device_map='auto',
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
