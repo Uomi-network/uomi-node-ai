@@ -86,17 +86,12 @@ class TransformersModelManager:
                 print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
                 max_memory = None
 
-        # Auto-configure max_memory for multi-GPU if not set
+        # Don't auto-set max_memory - it causes model to fall back to CPU
+        # device_map="auto" will use all available GPU memory automatically
         if max_memory is None and torch.cuda.is_available():
             num_gpus = torch.cuda.device_count()
             if num_gpus > 1:
-                max_memory = {}
-                for i in range(num_gpus):
-                    total_mem_bytes = torch.cuda.get_device_properties(i).total_memory
-                    # Reserve 2GB for overhead, convert to GiB
-                    usable_gib = int((total_mem_bytes - 2 * 1024**3) / (1024**3))
-                    max_memory[i] = f"{usable_gib}GiB"
-                print(f"[model-load] Auto-detected {num_gpus} GPUs, max_memory={max_memory}")
+                print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
 
         device_map_env = os.getenv("DEVICE_MAP", "auto")
         print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
