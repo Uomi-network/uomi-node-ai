@@ -106,16 +106,19 @@ class TransformersModelManager:
                 **self.model_config.model_kwargs
             )
         
-        # Force model to GPU if it ended up on CPU despite CUDA availability
-        model_device = next(self.current_gpu_model.parameters()).device
-        if str(model_device) == 'cpu' and self.device == 'cuda':
-            print(f"[model-load] Moving model from CPU to {self.device}")
-            try:
-                self.current_gpu_model = self.current_gpu_model.to(self.device)
-                print(f"[model-load] Successfully moved model to {self.device}")
-            except Exception as e:
-                print(f"[model-load] Failed to move model to GPU: {e}")
-                self.device = 'cpu'  # Fallback to CPU
+        # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
+        if not hasattr(self.current_gpu_model, 'hf_device_map'):
+            model_device = next(self.current_gpu_model.parameters()).device
+            if str(model_device) == 'cpu' and self.device == 'cuda':
+                print(f"[model-load] Moving model from CPU to {self.device}")
+                try:
+                    self.current_gpu_model = self.current_gpu_model.to(self.device)
+                    print(f"[model-load] Successfully moved model to {self.device}")
+                except Exception as e:
+                    print(f"[model-load] Failed to move model to GPU: {e}")
+                    self.device = 'cpu'  # Fallback to CPU
+        else:
+            print(f"[model-load] Skipping .to() - model already distributed via device_map")
 
         # Optional torch.compile acceleration
         if os.getenv("TORCH_COMPILE", "0") == "1":
