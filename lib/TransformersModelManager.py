@@ -87,6 +87,7 @@ class TransformersModelManager:
                 max_memory = None
 
         device_map_env = os.getenv("DEVICE_MAP", "auto")
+        print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
         try:
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
