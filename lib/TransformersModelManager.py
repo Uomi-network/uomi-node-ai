@@ -113,13 +113,16 @@ class TransformersModelManager:
             # Try zero-CPU load first via Accelerate; if not available, fall back to device_map path
             try:
                 from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
+                from huggingface_hub import snapshot_download  # type: ignore
+                # Download snapshot locally for accelerate (requires a local checkpoint path)
+                local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
                 # Zero-CPU load: initialize empty model on meta and dispatch weights directly to GPU
-                cfg = AutoConfig.from_pretrained(self.model_config.model_name, cache_dir=MODELS_FOLDER)
+                cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
                 with init_empty_weights():
                     empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
                 self.current_gpu_model = load_checkpoint_and_dispatch(
                     empty_model,
-                    self.model_config.model_name,
+                    checkpoint=local_dir,
                     device_map={"": self.force_device},
                     dtype=load_dtype,
                     no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
