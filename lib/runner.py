@@ -86,6 +86,7 @@ class RunnerExecutor:
                 continue
             for req in sorted(pending, key=lambda r: r["timestamp_pending"]):
                 model = req["request"].get("model")
+                request_id = req['request'].get('request_id', 'unknown')
                 if model not in TEST_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
                     model = DEEPSEEK_MODEL_CONFIG.model_name
                     req["request"]["model"] = model
@@ -110,7 +111,7 @@ class RunnerExecutor:
                             ChatExecutor().execute([req["request"]["input"]], self.test_model_manager, on_finished)
                     elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_manager is not None:
                         # Continuous submission
-                        print(f"🟢 Dispatching transformers request {req['uuid']}")
+                        print(f"🟢 Dispatching transformers request {req['uuid']} {request_id}")
                         input_json = req["request"]["input"]
                         import json
                         payload = json.loads(input_json)
@@ -131,7 +132,7 @@ class RunnerExecutor:
                             try:
                                 proof_obj = json.loads(unzip_string(req["request"]["proof"]))
                             except Exception as e:
-                                print(f"[verify-log] failed to unzip/parse proof: {e}")
+                                print(f"[verify-log] failed to unzip/parse proof: {e} request_id = {request_id}")
                                 proof_obj = {"tokens": []}
                             # Server-side diagnostic: print received proof token ids and decoded tokens
                             try:
@@ -146,17 +147,17 @@ class RunnerExecutor:
                                             decoded_tokens.append(tokenizer.decode([int(tid)], skip_special_tokens=True))
                                         except Exception:
                                             decoded_tokens.append('')
-                                print(f"[verify-log] received proof token_ids={token_ids}")
-                                print(f"[verify-log] received proof decoded_tokens={decoded_tokens}")
+                                print(f"[verify-log] received proof token_ids={token_ids} for request_id = {request_id}")
+                                print(f"[verify-log] received proof decoded_tokens={decoded_tokens} for request_id = {request_id}")
                                 # Also print the actual prompt text the server will verify against
                                 if tokenizer is not None:
                                     try:
                                         prompt_preview = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
-                                        print(f"[verify-log] prompt_preview='{prompt_preview[:400]}'")
+                                        print(f"[verify-log] prompt_preview='{prompt_preview[:400]} ...' for request_id = {request_id}")
                                     except Exception as _:
                                         pass
                             except Exception as e:
-                                print(f"[verify-log] error while logging proof diagnostics: {e}")
+                                print(f"[verify-log] error while logging proof diagnostics: {e} for request_id = {request_id}")
                             forced_ids = [t["id"] for t in proof_obj["tokens"]]
                             # In check mode, limit generation exactly to proof length
                             max_new_tokens = len(forced_ids)
@@ -164,7 +165,7 @@ class RunnerExecutor:
                             forced_ids = None
                         def on_token(sid, txt, meta, rq=req):
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
-                                print(f"[stream] req={rq['uuid']} sid={sid[:6]} token={meta.get('id')} txt='{txt}'")
+                                print(f"[stream] req={rq['uuid']} sid={sid[:6]} token={meta.get('id')} txt='{txt}' for request_id = {request_id}")
                         def on_complete(sid, response, proof, rq=req):
                             from lib.zipper import zip_string
                             import json as _j
