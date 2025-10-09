@@ -46,6 +46,9 @@ class TransformersModelManager:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         # When provided, force loading the entire model on a specific GPU device (e.g. 'cuda:0')
         self.force_device = force_device
+        if self.force_device is not None and torch.cuda.is_available():
+            # Align logical device to the forced target so downstream components use it
+            self.device = self.force_device
 
         self.warpers = [
             TemperatureLogitsWarper(TRANSFORMERS_INFERENCE_TEMPERATURE),
@@ -130,7 +133,8 @@ class TransformersModelManager:
                 )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
-        if not hasattr(self.current_gpu_model, 'hf_device_map'):
+        # and no forced device pinning was requested
+        if (self.force_device is None) and (not hasattr(self.current_gpu_model, 'hf_device_map')):
             model_device = next(self.current_gpu_model.parameters()).device
             if str(model_device) == 'cpu' and self.device == 'cuda':
                 print(f"[model-load] Moving model from CPU to {self.device}")
@@ -139,9 +143,8 @@ class TransformersModelManager:
                     print(f"[model-load] Successfully moved model to {self.device}")
                 except Exception as e:
                     print(f"[model-load] Failed to move model to GPU: {e}")
-                    self.device = 'cpu'  # Fallback to CPU
         else:
-            print(f"[model-load] Skipping .to() - model already distributed via device_map")
+            print(f"[model-load] Skipping .to() - model placed via device_map or forced device")
 
         # Optional torch.compile acceleration
         if os.getenv("TORCH_COMPILE", "0") == "1":
