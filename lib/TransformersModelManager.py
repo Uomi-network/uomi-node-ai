@@ -125,9 +125,11 @@ class TransformersModelManager:
                     **self.model_config.model_kwargs
                 )
         else:
-            # Load without device_map, will move to specific GPU afterwards
+            # Load directly onto specific GPU to avoid OOM when loading multiple instances
+            # Using device_map with single GPU ID loads directly without CPU intermediate step
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
+                device_map={"": self.device},  # Load all layers directly to target device
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
                 **self.model_config.model_kwargs
