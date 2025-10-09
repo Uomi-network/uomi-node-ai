@@ -257,11 +257,12 @@ class RunnerExecutor:
         loads = [(tm, tm.get_load()) for tm in self.transformers_model_managers]
         loads.sort(key=lambda x: x[1])
         chosen = loads[0][0]
-        if os.getenv('CONTINUOUS_DEBUG','0') == '1':
-            try:
-                idx = self.transformers_model_managers.index(chosen)
-            except ValueError:
-                idx = -1
-            print(f"[scheduler] chosen replica index={idx} load={loads[0][1]}")
+        # Always log the chosen replica for debugging load balancing
+        try:
+            idx = self.transformers_model_managers.index(chosen)
+            device = chosen.force_device or chosen.device
+            print(f"[scheduler] chosen replica index={idx} device={device} load={loads[0][1]}")
+        except Exception:
+            print(f"[scheduler] chosen replica load={loads[0][1]}")
         return chosen
 
