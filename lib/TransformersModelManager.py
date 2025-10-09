@@ -172,9 +172,21 @@ class TransformersModelManager:
         if hasattr(self.current_gpu_model, 'hf_device_map'):
             print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
         
-        # Report actual model device placement
-        model_device = next(self.current_gpu_model.parameters()).device
+        # Report actual model device placement (may show 'cpu' for dispatched models)
+        try:
+            model_device = next(self.current_gpu_model.parameters()).device
+        except StopIteration:
+            model_device = 'unknown'
         print(f"[model-load] Model loaded on device: {model_device}")
+        # Also report effective input device for generation
+        effective_device = self._resolve_input_device()
+        print(f"[model-load] Effective input device: {effective_device}")
+        # Strict policy: if force_device is set, ensure we are truly on that CUDA device
+        if self.force_device is not None:
+            if not (isinstance(effective_device, str) and effective_device.startswith('cuda')):
+                raise RuntimeError(f"Model effective device is '{effective_device}' but GPU '{self.force_device}' was requested; refusing CPU fallback")
+            if str(effective_device) != str(self.force_device):
+                print(f"⚠️  [model-load] Effective device '{effective_device}' does not match requested '{self.force_device}'")
         
         if self.device == 'cpu':
             print("CUDA not available, model loaded on CPU")
@@ -185,6 +197,36 @@ class TransformersModelManager:
         # Continuous batcher disabled by default
         self.continuous_batcher: ContinuousBatcher | None = None
         self.fast_continuous_batcher: FastContinuousBatcher | None = None
+
+    def _resolve_input_device(self) -> str:
+        """Determine the device inputs should be placed on for generate().
+        If the model is dispatched with hf_device_map, prefer that mapping; otherwise fall back to force_device/self.device.
+        """
+        # Highest priority: explicit forced device
+        if self.force_device is not None:
+            return str(self.force_device)
+        try:
+            if hasattr(self.current_gpu_model, 'hf_device_map') and isinstance(self.current_gpu_model.hf_device_map, dict):
+                dm = self.current_gpu_model.hf_device_map
+                # Prefer any CUDA placement in the map
+                cuda_devices = []
+                for v in dm.values():
+                    if isinstance(v, str) and v.startswith('cuda'):
+                        cuda_devices.append(v)
+                if cuda_devices:
+                    # Pick the lowest-index CUDA device
+                    try:
+                        cuda_devices.sort(key=lambda s: int(s.split(':',1)[1]) if ':' in s else 0)
+                    except Exception:
+                        pass
+                    return cuda_devices[0]
+                # Fallback: if only CPU is found, acknowledge it
+                for v in dm.values():
+                    if isinstance(v, str):
+                        return v
+        except Exception:
+            pass
+        return str(self.device)
 
     def get_load(self) -> int:
         """Return a simple load metric for scheduling: pending + active in the active batcher."""
@@ -205,11 +247,13 @@ class TransformersModelManager:
     def enable_continuous(self, max_active: int | None = None, use_fast: bool = True):
         if use_fast:
             if self.fast_continuous_batcher is None:
-                self.fast_continuous_batcher = FastContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+                eff_dev = self._resolve_input_device()
+                self.fast_continuous_batcher = FastContinuousBatcher(self.current_gpu_model, self.tokenizer, eff_dev, max_active=max_active or 5)
             return self.fast_continuous_batcher
         else:
             if self.continuous_batcher is None:
-                self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, self.device, max_active=max_active or 5)
+                eff_dev = self._resolve_input_device()
+                self.continuous_batcher = ContinuousBatcher(self.current_gpu_model, self.tokenizer, eff_dev, max_active=max_active or 5)
             return self.continuous_batcher
 
     def submit_continuous(self, messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=False, forced_tokens=None):

@@ -41,8 +41,13 @@ class FastContinuousBatcher:
         
         self.model = model
         self.tokenizer = tokenizer
-        # Use the actual device of the model, not the passed device
-        self.device = next(model.parameters()).device if hasattr(model, 'parameters') else device
+        # Respect the caller-provided device. Fallback to model param device only if not provided.
+        self.device = device
+        if self.device is None:
+            try:
+                self.device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
+            except StopIteration:
+                self.device = 'cpu'
         print(f"[fast_batcher] Using device: {self.device}")
         self.max_active = max_active
         self.pending: Deque[BatchRequest] = deque()
