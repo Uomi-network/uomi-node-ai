@@ -110,7 +110,9 @@ class TransformersModelManager:
                 torch.cuda.set_device(gid)
             except Exception as e:
                 print(f"[model-load] Warning: failed to set CUDA device context: {e}")
-            # Try zero-CPU load first via Accelerate; if not available, fall back to device_map path
+            # Empty cache to reduce fragmentation before loading
+            torch.cuda.empty_cache()
+            # Try zero-CPU load first via Accelerate; if not available, fail hard (no CPU fallback)
             try:
                 from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
                 from huggingface_hub import snapshot_download  # type: ignore
@@ -120,24 +122,19 @@ class TransformersModelManager:
                 cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
                 with init_empty_weights():
                     empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
-                self.current_gpu_model = load_checkpoint_and_dispatch(
-                    empty_model,
-                    checkpoint=local_dir,
-                    device_map={"": self.force_device},
-                    dtype=load_dtype,
-                    no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
-                )
+                with torch.cuda.device(gid):
+                    self.current_gpu_model = load_checkpoint_and_dispatch(
+                        empty_model,
+                        checkpoint=local_dir,
+                        device_map={"": self.force_device},
+                        max_memory={gid: "20GiB"},  # Limit to 20GiB per GPU to leave headroom
+                        dtype=load_dtype,
+                        no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
+                    )
                 print("[model-load] Loaded via Accelerate with zero-CPU dispatch")
             except Exception as e:
-                print(f"[model-load] Accelerate path unavailable/failed ({e}); using from_pretrained with device_map (low_cpu_mem_usage)")
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_config.model_name,
-                    device_map={"": self.force_device},
-                    torch_dtype=load_dtype,
-                    cache_dir=MODELS_FOLDER,
-                    low_cpu_mem_usage=True,
-                    **self.model_config.model_kwargs
-                )
+                print(f"[model-load] Accelerate path failed ({e}); no CPU fallback allowed - failing startup")
+                raise RuntimeError(f"Failed to load model on GPU {self.force_device} without CPU usage: {e}")
         else:
             # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
             if max_memory is None and torch.cuda.is_available():
