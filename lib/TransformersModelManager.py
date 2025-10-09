@@ -42,6 +42,9 @@ class TransformersModelConfig:
 class TransformersModelManager:
     def __init__(self, model_config: TransformersModelConfig, force_device: str | None = None):
         """Single-model manager (DeepSeek only) kept always on GPU (or CPU if CUDA unavailable)."""
+        # Clear GPU cache early to free any residual memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.model_config = model_config
         self.model_name = model_config.model_name
         self.seed = 42
@@ -127,7 +130,7 @@ class TransformersModelManager:
                         empty_model,
                         checkpoint=local_dir,
                         device_map={"": self.force_device},
-                        max_memory={gid: "20GiB"},  # Limit to 20GiB per GPU to leave headroom
+                        max_memory={gid: "18GiB"},  # Limit to 18GiB per GPU to leave more headroom
                         dtype=load_dtype,
                         no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
                     )
