@@ -6,6 +6,7 @@ from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MA
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
 from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
+import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
 class RunnerQueue:
@@ -52,15 +53,29 @@ class RunnerExecutor:
         self.microbatch_window_ms = 30
         self.test_model_manager = TestModelManager(TEST_MODEL_CONFIG)
         if test_mode:
-            self.transformers_model_manager = None
+            self.transformers_model_managers = []
             self.sana_model_manager = None
         else:
-            # Single DeepSeek transformers model always resident (enable continuous batching)
-            self.transformers_model_manager = TransformersModelManager(DEEPSEEK_MODEL_CONFIG)
-            # Use fast continuous batcher by default, but allow override with FAST_CONTINUOUS_BATCHER=0
+            # Create one independent replica of the model per available GPU and balance between them
+            self.transformers_model_managers = []
             use_fast = os.getenv("FAST_CONTINUOUS_BATCHER", "1") == "1"
-            self.transformers_model_manager.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
-            print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled")
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                target_gpus = list(range(gpu_count))
+                # Optional override to limit number of replicas
+                max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "0") or "0")
+                if max_replicas > 0:
+                    target_gpus = target_gpus[:max_replicas]
+                for gid in target_gpus:
+                    dev = f"cuda:{gid}"
+                    print(f"🔧 Spawning model replica on {dev}")
+                    tm = TransformersModelManager(DEEPSEEK_MODEL_CONFIG, force_device=dev)
+                    tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                    self.transformers_model_managers.append(tm)
+                print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled on {len(self.transformers_model_managers)} GPU(s)")
+            else:
+                # Explicitly avoid CPU fallback per requirements; raise if no CUDA
+                raise RuntimeError("CUDA is required; CPU inference is not allowed by configuration")
             # self.sana_model_manager = SanaModelManager(SANA_MODEL_CONFIG)
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.start)
@@ -109,7 +124,7 @@ class RunnerExecutor:
                             ChatExecutor().check([req["request"]["input"]],[req["request"]["proof"]], self.test_model_manager, on_finished)
                         else:
                             ChatExecutor().execute([req["request"]["input"]], self.test_model_manager, on_finished)
-                    elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_manager is not None:
+                    elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_managers:
                         # Continuous submission
                         print(f"🟢 Dispatching transformers request {req['uuid']} {request_id}")
                         input_json = req["request"]["input"]
@@ -137,8 +152,8 @@ class RunnerExecutor:
                             # Server-side diagnostic: print received proof token ids and decoded tokens
                             try:
                                 tokenizer = None
-                                if self.transformers_model_manager is not None:
-                                    tokenizer = self.transformers_model_manager.get_tokenizer(None)
+                                if self.transformers_model_managers:
+                                    tokenizer = self.transformers_model_managers[0].get_tokenizer(None)
                                 token_ids = [t.get('id') for t in proof_obj.get('tokens', [])]
                                 decoded_tokens = []
                                 if tokenizer is not None and token_ids:
@@ -193,7 +208,9 @@ class RunnerExecutor:
                                     rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": "verification_failed"}
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
-                        self.transformers_model_manager.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
+                        # Pick the least loaded replica and submit
+                        target_tm = self._pick_transformers_manager()
+                        target_tm.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
                     # elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                     #     def on_finished(_idx, output, rq=req):
                     #         with self.lock:
@@ -214,4 +231,19 @@ class RunnerExecutor:
                         req["output"] = {"result": False, "error": f"Processing error: {e}"}
             if not dispatched:
                 time.sleep(BATCH_WAIT_SEC)
+
+    def _pick_transformers_manager(self):
+        """Pick the least-loaded transformers model replica for dispatch."""
+        if not self.transformers_model_managers:
+            raise RuntimeError("Transformers managers not initialized")
+        loads = [(tm, tm.get_load()) for tm in self.transformers_model_managers]
+        loads.sort(key=lambda x: x[1])
+        chosen = loads[0][0]
+        if os.getenv('CONTINUOUS_DEBUG','0') == '1':
+            try:
+                idx = self.transformers_model_managers.index(chosen)
+            except ValueError:
+                idx = -1
+            print(f"[scheduler] chosen replica index={idx} load={loads[0][1]}")
+        return chosen
 

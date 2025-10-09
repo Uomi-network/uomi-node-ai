@@ -38,12 +38,14 @@ class TransformersModelConfig:
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
 
 class TransformersModelManager:
-    def __init__(self, model_config: TransformersModelConfig):
+    def __init__(self, model_config: TransformersModelConfig, force_device: str | None = None):
         """Single-model manager (DeepSeek only) kept always on GPU (or CPU if CUDA unavailable)."""
         self.model_config = model_config
         self.model_name = model_config.model_name
         self.seed = 42
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # When provided, force loading the entire model on a specific GPU device (e.g. 'cuda:0')
+        self.force_device = force_device
 
         self.warpers = [
             TemperatureLogitsWarper(TRANSFORMERS_INFERENCE_TEMPERATURE),
@@ -64,7 +66,7 @@ class TransformersModelManager:
             self.tokenizer.chat_template = self.model_config.tokenizer_kwargs["chat_template"]
 
         # Load model
-        print(f"Loading model {self.model_name} to device {self.device}")
+        print(f"Loading model {self.model_name} to device {self.force_device or self.device}")
         load_dtype = torch.float16 if self.device == 'cuda' else torch.float32
         # Allow overriding attention implementation / device map / max memory via env without code change
         # ATTN_IMPL example: flash_attention_2 (if supported by installed transformers version)
@@ -86,33 +88,46 @@ class TransformersModelManager:
                 print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
                 max_memory = None
 
-        # Don't auto-set max_memory - it causes model to fall back to CPU
-        # device_map="auto" will use all available GPU memory automatically
-        if max_memory is None and torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            if num_gpus > 1:
-                print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
+        # When force_device is set, map the entire model to that GPU explicitly to avoid CPU fallback
+        # Otherwise, honor DEVICE_MAP env (default 'auto') and optional MAX_MEMORY
+        if self.force_device is not None and torch.cuda.is_available():
+            explicit_map = {'': self.force_device}
+            print(f"[model-load] Forcing device_map={explicit_map}")
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map=explicit_map,
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                low_cpu_mem_usage=True,
+                **self.model_config.model_kwargs
+            )
+        else:
+            # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
+            if max_memory is None and torch.cuda.is_available():
+                num_gpus = torch.cuda.device_count()
+                if num_gpus > 1:
+                    print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
 
-        device_map_env = os.getenv("DEVICE_MAP", "auto")
-        print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-        try:
-            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                self.model_config.model_name,
-                device_map=device_map_env,
-                max_memory=max_memory,
-                torch_dtype=load_dtype,
-                cache_dir=MODELS_FOLDER,
-                **self.model_config.model_kwargs
-            )
-        except Exception as e:
-            print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
-            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                self.model_config.model_name,
-                device_map='auto',
-                torch_dtype=load_dtype,
-                cache_dir=MODELS_FOLDER,
-                **self.model_config.model_kwargs
-            )
+            device_map_env = os.getenv("DEVICE_MAP", "auto")
+            print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+            try:
+                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_config.model_name,
+                    device_map=device_map_env,
+                    max_memory=max_memory,
+                    torch_dtype=load_dtype,
+                    cache_dir=MODELS_FOLDER,
+                    **self.model_config.model_kwargs
+                )
+            except Exception as e:
+                print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_config.model_name,
+                    device_map='auto',
+                    torch_dtype=load_dtype,
+                    cache_dir=MODELS_FOLDER,
+                    **self.model_config.model_kwargs
+                )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
         if not hasattr(self.current_gpu_model, 'hf_device_map'):
@@ -154,6 +169,22 @@ class TransformersModelManager:
         # Continuous batcher disabled by default
         self.continuous_batcher: ContinuousBatcher | None = None
         self.fast_continuous_batcher: FastContinuousBatcher | None = None
+
+    def get_load(self) -> int:
+        """Return a simple load metric for scheduling: pending + active in the active batcher."""
+        if self.fast_continuous_batcher is not None:
+            try:
+                st = self.fast_continuous_batcher.status()
+                return int(st.get('pending', 0)) + int(st.get('active', 0))
+            except Exception:
+                return 0
+        if self.continuous_batcher is not None:
+            try:
+                st = self.continuous_batcher.status()
+                return int(st.get('pending', 0)) + int(st.get('active', 0))
+            except Exception:
+                return 0
+        return 0
 
     def enable_continuous(self, max_active: int | None = None, use_fast: bool = True):
         if use_fast:
