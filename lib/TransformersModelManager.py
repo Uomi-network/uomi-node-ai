@@ -75,7 +75,7 @@ class TransformersModelManager:
 
         # Load model
         print(f"Loading model {self.model_name} to device {self.force_device or self.device}")
-        load_dtype = torch.float16 if self.device == 'cuda' else torch.float32
+        load_dtype = torch.float16# if self.device == 'cuda' else torch.float32
         # Allow overriding attention implementation / device map / max memory via env without code change
         # ATTN_IMPL example: flash_attention_2 (if supported by installed transformers version)
         attn_impl = os.getenv("ATTN_IMPL")
