@@ -136,7 +136,10 @@ class TransformersModelManager:
             )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
-        if not hasattr(self.current_gpu_model, 'hf_device_map'):
+        # When gpu_id is specified, we always use device_map, so skip .to()
+        if self.gpu_id is not None:
+            print(f"[model-load] Model loaded directly to {self.device} via device_map")
+        elif not hasattr(self.current_gpu_model, 'hf_device_map'):
             model_device = next(self.current_gpu_model.parameters()).device
             if str(model_device) == 'cpu' and 'cuda' in self.device:
                 print(f"[model-load] Moving model from CPU to {self.device}")
