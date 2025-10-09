@@ -92,10 +92,14 @@ class TransformersModelManager:
                 max_memory = None
 
         # When force_device is set, place entire model on that GPU explicitly to avoid CPU or other GPU usage
-        # Strategy: set active CUDA device, load weights on CPU (streamed), then .to(force_device)
+        # Strategy: set allocator for fragmentation resilience, set current device, and load with device_map
         if self.force_device is not None and torch.cuda.is_available():
             print(f"[model-load] Forcing single-device placement on {self.force_device}")
-            # Set current device so any implicit allocations use the right GPU
+            # Improve fragmentation resilience if not already set
+            alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF')
+            if not alloc_conf:
+                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            # Set current device so implicit allocations use the right GPU
             try:
                 if ':' in self.force_device:
                     gid = int(self.force_device.split(':',1)[1])
@@ -104,17 +108,15 @@ class TransformersModelManager:
                 torch.cuda.set_device(gid)
             except Exception as e:
                 print(f"[model-load] Warning: failed to set CUDA device context: {e}")
-            # Load without device_map to keep initial weights on CPU, then move
+            # Load directly onto the target GPU
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
+                device_map={"": self.force_device},
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
                 low_cpu_mem_usage=True,
                 **self.model_config.model_kwargs
             )
-            # Move to the forced device
-            print(f"[model-load] Moving model from CPU to {self.force_device}")
-            self.current_gpu_model = self.current_gpu_model.to(self.force_device)
         else:
             # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
             if max_memory is None and torch.cuda.is_available():

@@ -61,7 +61,19 @@ class RunnerExecutor:
             use_fast = os.getenv("FAST_CONTINUOUS_BATCHER", "1") == "1"
             if torch.cuda.is_available():
                 gpu_count = torch.cuda.device_count()
-                target_gpus = list(range(gpu_count))
+                # Prefer GPUs with most free memory to minimize initial OOM risk
+                try:
+                    mem_stats = []
+                    for gid in range(gpu_count):
+                        stats = torch.cuda.memory_stats(gid)
+                        # use total_reserved - allocated as free within PyTorch; not exact but indicative
+                        reserved = int(stats.get('reserved_bytes.all.current', 0))
+                        allocated = int(stats.get('allocated_bytes.all.current', 0))
+                        free_est = max(0, reserved - allocated)
+                        mem_stats.append((gid, free_est))
+                    target_gpus = [gid for gid,_ in sorted(mem_stats, key=lambda x: x[1], reverse=True)]
+                except Exception:
+                    target_gpus = list(range(gpu_count))
                 # Optional override to limit number of replicas
                 max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "0") or "0")
                 if max_replicas > 0:
@@ -69,9 +81,15 @@ class RunnerExecutor:
                 for gid in target_gpus:
                     dev = f"cuda:{gid}"
                     print(f"🔧 Spawning model replica on {dev}")
-                    tm = TransformersModelManager(DEEPSEEK_MODEL_CONFIG, force_device=dev)
-                    tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
-                    self.transformers_model_managers.append(tm)
+                    try:
+                        tm = TransformersModelManager(DEEPSEEK_MODEL_CONFIG, force_device=dev)
+                        tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                        self.transformers_model_managers.append(tm)
+                    except Exception as e:
+                        print(f"❌ Failed to spawn replica on {dev}: {e}")
+                        continue
+                if not self.transformers_model_managers:
+                    raise RuntimeError("Failed to spawn any GPU replicas; check GPU memory and environment")
                 print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled on {len(self.transformers_model_managers)} GPU(s)")
             else:
                 # Explicitly avoid CPU fallback per requirements; raise if no CUDA
