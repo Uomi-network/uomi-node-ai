@@ -91,19 +91,30 @@ class TransformersModelManager:
                 print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
                 max_memory = None
 
-        # When force_device is set, map the entire model to that GPU explicitly to avoid CPU fallback
-        # Otherwise, honor DEVICE_MAP env (default 'auto') and optional MAX_MEMORY
+        # When force_device is set, place entire model on that GPU explicitly to avoid CPU or other GPU usage
+        # Strategy: set active CUDA device, load weights on CPU (streamed), then .to(force_device)
         if self.force_device is not None and torch.cuda.is_available():
-            explicit_map = {'': self.force_device}
-            print(f"[model-load] Forcing device_map={explicit_map}")
+            print(f"[model-load] Forcing single-device placement on {self.force_device}")
+            # Set current device so any implicit allocations use the right GPU
+            try:
+                if ':' in self.force_device:
+                    gid = int(self.force_device.split(':',1)[1])
+                else:
+                    gid = 0
+                torch.cuda.set_device(gid)
+            except Exception as e:
+                print(f"[model-load] Warning: failed to set CUDA device context: {e}")
+            # Load without device_map to keep initial weights on CPU, then move
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
-                device_map=explicit_map,
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
                 low_cpu_mem_usage=True,
                 **self.model_config.model_kwargs
             )
+            # Move to the forced device
+            print(f"[model-load] Moving model from CPU to {self.force_device}")
+            self.current_gpu_model = self.current_gpu_model.to(self.force_device)
         else:
             # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
             if max_memory is None and torch.cuda.is_available():
