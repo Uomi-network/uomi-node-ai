@@ -38,16 +38,12 @@ class TransformersModelConfig:
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
 
 class TransformersModelManager:
-    def __init__(self, model_config: TransformersModelConfig, gpu_id: int | None = None):
+    def __init__(self, model_config: TransformersModelConfig):
         """Single-model manager (DeepSeek only) kept always on GPU (or CPU if CUDA unavailable)."""
         self.model_config = model_config
         self.model_name = model_config.model_name
         self.seed = 42
-        self.gpu_id = gpu_id
-        if gpu_id is not None and torch.cuda.is_available():
-            self.device = f'cuda:{gpu_id}'
-        else:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         self.warpers = [
             TemperatureLogitsWarper(TRANSFORMERS_INFERENCE_TEMPERATURE),
@@ -77,71 +73,51 @@ class TransformersModelManager:
             # do not overwrite if user already passed something explicitly
             self.model_config.model_kwargs.setdefault("attn_implementation", attn_impl)
 
-        # If a specific GPU ID was provided, use it directly instead of device_map
-        if self.gpu_id is not None:
-            device_map_env = None
-            max_memory = None
-            print(f"[model-load] Loading model on GPU {self.gpu_id}")
-        else:
-            # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
-            max_memory_env = os.getenv("MAX_MEMORY")
-            max_memory = None
-            if max_memory_env:
-                try:
-                    max_memory = {}
-                    for part in max_memory_env.split(','):
-                        gid, cap = part.split(':', 1)
-                        max_memory[int(gid.strip())] = cap.strip()
-                except Exception as e:
-                    print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
-                    max_memory = None
-
-            # Don't auto-set max_memory - it causes model to fall back to CPU
-            # device_map="auto" will use all available GPU memory automatically
-            if max_memory is None and torch.cuda.is_available():
-                num_gpus = torch.cuda.device_count()
-                if num_gpus > 1:
-                    print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
-
-            device_map_env = os.getenv("DEVICE_MAP", "auto")
-            print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-        if device_map_env is not None:
+        # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
+        max_memory_env = os.getenv("MAX_MEMORY")
+        max_memory = None
+        if max_memory_env:
             try:
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_config.model_name,
-                    device_map=device_map_env,
-                    max_memory=max_memory,
-                    torch_dtype=load_dtype,
-                    cache_dir=MODELS_FOLDER,
-                    **self.model_config.model_kwargs
-                )
+                max_memory = {}
+                for part in max_memory_env.split(','):
+                    gid, cap = part.split(':', 1)
+                    max_memory[int(gid.strip())] = cap.strip()
             except Exception as e:
-                print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_config.model_name,
-                    device_map='auto',
-                    torch_dtype=load_dtype,
-                    cache_dir=MODELS_FOLDER,
-                    **self.model_config.model_kwargs
-                )
-        else:
-            # Load directly onto specific GPU to avoid OOM when loading multiple instances
-            # Using device_map with single GPU ID loads directly without CPU intermediate step
+                print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
+                max_memory = None
+
+        # Don't auto-set max_memory - it causes model to fall back to CPU
+        # device_map="auto" will use all available GPU memory automatically
+        if max_memory is None and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
+
+        device_map_env = os.getenv("DEVICE_MAP", "auto")
+        print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+        try:
             self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
-                device_map={"": self.device},  # Load all layers directly to target device
+                device_map=device_map_env,
+                max_memory=max_memory,
+                torch_dtype=load_dtype,
+                cache_dir=MODELS_FOLDER,
+                **self.model_config.model_kwargs
+            )
+        except Exception as e:
+            print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map='auto',
                 torch_dtype=load_dtype,
                 cache_dir=MODELS_FOLDER,
                 **self.model_config.model_kwargs
             )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
-        # When gpu_id is specified, we always use device_map, so skip .to()
-        if self.gpu_id is not None:
-            print(f"[model-load] Model loaded directly to {self.device} via device_map")
-        elif not hasattr(self.current_gpu_model, 'hf_device_map'):
+        if not hasattr(self.current_gpu_model, 'hf_device_map'):
             model_device = next(self.current_gpu_model.parameters()).device
-            if str(model_device) == 'cpu' and 'cuda' in self.device:
+            if str(model_device) == 'cpu' and self.device == 'cuda':
                 print(f"[model-load] Moving model from CPU to {self.device}")
                 try:
                     self.current_gpu_model = self.current_gpu_model.to(self.device)
