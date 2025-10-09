@@ -4,7 +4,7 @@ import os
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
 from transformers import (
@@ -14,6 +14,8 @@ from transformers import (
 )
 from lib.continuous_batcher import ContinuousBatcher
 from lib.fast_continuous_batcher import FastContinuousBatcher
+
+# Note: We'll import accelerate lazily in the forced-device branch to avoid optional dependency warnings
 
 class Sampling:
     def __init__(self, seed: int, device: str = "cpu"):
@@ -108,15 +110,31 @@ class TransformersModelManager:
                 torch.cuda.set_device(gid)
             except Exception as e:
                 print(f"[model-load] Warning: failed to set CUDA device context: {e}")
-            # Load directly onto the target GPU
-            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                self.model_config.model_name,
-                device_map={"": self.force_device},
-                torch_dtype=load_dtype,
-                cache_dir=MODELS_FOLDER,
-                low_cpu_mem_usage=True,
-                **self.model_config.model_kwargs
-            )
+            # Try zero-CPU load first via Accelerate; if not available, fall back to device_map path
+            try:
+                from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
+                # Zero-CPU load: initialize empty model on meta and dispatch weights directly to GPU
+                cfg = AutoConfig.from_pretrained(self.model_config.model_name, cache_dir=MODELS_FOLDER)
+                with init_empty_weights():
+                    empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
+                self.current_gpu_model = load_checkpoint_and_dispatch(
+                    empty_model,
+                    self.model_config.model_name,
+                    device_map={"": self.force_device},
+                    dtype=load_dtype,
+                    no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
+                )
+                print("[model-load] Loaded via Accelerate with zero-CPU dispatch")
+            except Exception as e:
+                print(f"[model-load] Accelerate path unavailable/failed ({e}); using from_pretrained with device_map (low_cpu_mem_usage)")
+                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_config.model_name,
+                    device_map={"": self.force_device},
+                    torch_dtype=load_dtype,
+                    cache_dir=MODELS_FOLDER,
+                    low_cpu_mem_usage=True,
+                    **self.model_config.model_kwargs
+                )
         else:
             # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
             if max_memory is None and torch.cuda.is_available():
@@ -177,7 +195,7 @@ class TransformersModelManager:
             model_device = next(self.current_gpu_model.parameters()).device
         except StopIteration:
             model_device = 'unknown'
-        print(f"[model-load] Model loaded on device: {model_device}")
+        print(f"[model-load] Parameter device hint (may be 'cpu' for dispatched models): {model_device}")
         # Also report effective input device for generation
         effective_device = self._resolve_input_device()
         print(f"[model-load] Effective input device: {effective_device}")
