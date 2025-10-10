@@ -44,8 +44,7 @@ class TGIClient:
         default_params = {
             "max_new_tokens": 512,
             "temperature": 0.7,
-            "top_k": 50,
-            "top_p": 0.9,
+            "top_k": 5,
             "repetition_penalty": 1.1,
             "do_sample": True
         }
@@ -108,7 +107,8 @@ class TGIClient:
         # Prepare TGI request from messages and parameters
         tgi_request = self._prepare_tgi_request(messages, parameters or {})
         tgi_request["parameters"]["max_new_tokens"] = len(forced_tokens)
-        tgi_request["parameters"]["top_n_tokens"] = max(tgi_request["parameters"].get("top_n_tokens", 20), 1)
+        tgi_request["parameters"]["top_k"] = max(tgi_request["parameters"].get("top_k", 10), 1)
+        tgi_request["parameters"]["top_n_tokens"] = max(tgi_request["parameters"].get("top_n_tokens", 10), 1)
 
         url = f"{self.base_url}/generate_stream"
         headers = {"Content-Type": "application/json"}
@@ -613,7 +613,7 @@ class TGIClient:
         effective_params = dict(tgi_request.get('parameters', {}))
         
         # Aggiungiamo sempre top_n_tokens per raccogliere proof data
-        tgi_request["parameters"]["top_n_tokens"] = 20
+        tgi_request["parameters"]["top_n_tokens"] = 5
         
         # Stream endpoint
         url = f"{self.base_url}/generate_stream"
