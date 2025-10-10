@@ -107,8 +107,8 @@ class TGIClient:
         # Prepare TGI request from messages and parameters
         tgi_request = self._prepare_tgi_request(messages, parameters or {})
         tgi_request["parameters"]["max_new_tokens"] = len(forced_tokens)
-        tgi_request["parameters"]["top_k"] = max(tgi_request["parameters"].get("top_k", 5), 5)
-        tgi_request["parameters"]["top_n_tokens"] = max(tgi_request["parameters"].get("top_n_tokens", 5), 1)
+        tgi_request["parameters"]["top_k"] = 10
+        tgi_request["parameters"]["top_n_tokens"] = 10
 
         url = f"{self.base_url}/generate_stream"
         headers = {"Content-Type": "application/json"}
@@ -426,7 +426,7 @@ class TGIClient:
         if not isinstance(tokens_expected, list) or len(tokens_expected) == 0:
             return {'result': False, 'error': 'Proof has no tokens', 'proof': None}
 
-        top_k = parameters.get('top_n_tokens', 5)
+        top_k = 10 #parameters.get('top_n_tokens', 5)
         # Build the flat text for replay: use _format_messages_to_text to compose messages
         # Then append output tokens progressively
         base_text = self._format_messages_to_text(messages)
@@ -455,6 +455,7 @@ class TGIClient:
             # Request parameters: ask for top_n_tokens
             req_params = dict(merged_params)
             req_params['max_new_tokens'] = 1
+            req_params['top_k'] = max(top_k, 5)
             req_params['top_n_tokens'] = max(top_k, 1)
 
             # For TGI, provide the accumulated_text as inputs so the model conditions on entire sequence
