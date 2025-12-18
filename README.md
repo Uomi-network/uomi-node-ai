@@ -60,6 +60,18 @@ sudo nano /etc/systemd/system/uomi-ai.service  # Edit paths as needed
 ```bash
 sudo systemctl enable uomi-ai
 sudo systemctl start uomi-ai
+
+# Check service status
+sudo systemctl status uomi-ai
+
+# View real-time logs
+journalctl -xe -u uomi-ai -f
+
+# Stop the service
+sudo systemctl stop uomi-ai
+
+# Restart the service
+sudo systemctl restart uomi-ai
 ```
 
 ## 📊 Monitoring
