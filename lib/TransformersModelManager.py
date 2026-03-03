@@ -143,12 +143,19 @@ class TransformersModelManager:
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    # Leave 1GiB per GPU as headroom; non-quantized layers can offload to CPU
-                    max_memory = {}
-                    for i in range(num_gpus):
-                        total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                        max_memory[i] = f"{total_gb - 1}GiB"
-                    print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
+                    has_quantization = 'quantization_config' in self.model_config.model_kwargs
+                    if has_quantization:
+                        # Quantized models (4-bit ~18-22GB, 8-bit ~36GB) are much smaller than BF16.
+                        # Do NOT set max_memory: accelerate estimates memory from BF16 disk size (~72GB)
+                        # and would dispatch layers to CPU. Let device_map='auto' use full GPU VRAM freely.
+                        print(f"[model-load] Quantized model on {num_gpus} GPUs: skipping max_memory (model fits in VRAM)")
+                    else:
+                        # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
+                        max_memory = {}
+                        for i in range(num_gpus):
+                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
+                            max_memory[i] = f"{total_gb - 1}GiB"
+                        print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
 
             device_map_env = os.getenv("DEVICE_MAP", "auto")
             print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
@@ -643,8 +650,9 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         'quantization_config': BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",          # Normal Float 4: better quality than standard int4
-            bnb_4bit_use_double_quant=True,     # Nested quantization: extra ~0.4 bits saved
+            bnb_4bit_quant_type="nf4",                    # Normal Float 4: better quality than standard int4
+            bnb_4bit_use_double_quant=True,               # Nested quantization: extra ~0.4 bits saved
+            llm_int8_enable_fp32_cpu_offload=True,        # Allow embedding/lm_head on CPU if needed
         ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
