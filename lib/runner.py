@@ -5,7 +5,10 @@ import os
 from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MAX_TOKENS
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
-from lib.TransformersModelManager import DEEPSEEK_MODEL_CONFIG, TransformersModelManager
+from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, TransformersModelManager
+
+# Active model config: swap to QWEN35_35B_A3B_MODEL_CONFIG for 2x RTX 4090 (48GB) deployment
+ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_MODEL_CONFIG
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
@@ -78,16 +81,27 @@ class RunnerExecutor:
                 max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "0") or "0")
                 if max_replicas > 0:
                     target_gpus = target_gpus[:max_replicas]
-                for gid in target_gpus:
-                    dev = f"cuda:{gid}"
-                    print(f"🔧 Spawning model replica on {dev}")
+                if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG:
+                    # Multi-GPU model: single instance distributed across all GPUs via device_map='auto'
+                    print(f"🔧 Spawning single multi-GPU instance of {ACTIVE_MODEL_CONFIG.model_name} across {len(target_gpus)} GPU(s)")
                     try:
-                        tm = TransformersModelManager(DEEPSEEK_MODEL_CONFIG, force_device=dev)
+                        tm = TransformersModelManager(ACTIVE_MODEL_CONFIG)
                         tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
                         self.transformers_model_managers.append(tm)
                     except Exception as e:
-                        print(f"❌ Failed to spawn replica on {dev}: {e}")
-                        continue
+                        print(f"❌ Failed to spawn multi-GPU instance: {e}")
+                else:
+                    # Single-GPU model: one replica per GPU
+                    for gid in target_gpus:
+                        dev = f"cuda:{gid}"
+                        print(f"🔧 Spawning model replica on {dev}")
+                        try:
+                            tm = TransformersModelManager(ACTIVE_MODEL_CONFIG, force_device=dev)
+                            tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                            self.transformers_model_managers.append(tm)
+                        except Exception as e:
+                            print(f"❌ Failed to spawn replica on {dev}: {e}")
+                            continue
                 if not self.transformers_model_managers:
                     raise RuntimeError("Failed to spawn any GPU replicas; check GPU memory and environment")
                 print(f"🚀 {'Fast' if use_fast else 'Legacy'} continuous batcher enabled on {len(self.transformers_model_managers)} GPU(s)")
@@ -120,8 +134,8 @@ class RunnerExecutor:
             for req in sorted(pending, key=lambda r: r["timestamp_pending"]):
                 model = req["request"].get("model")
                 request_id = req['request'].get('request_id', 'unknown')
-                if model not in TEST_MODEL_CONFIG and model != DEEPSEEK_MODEL_CONFIG.model_name:
-                    model = DEEPSEEK_MODEL_CONFIG.model_name
+                if model not in TEST_MODEL_CONFIG and model != ACTIVE_MODEL_CONFIG.model_name:
+                    model = ACTIVE_MODEL_CONFIG.model_name
                     req["request"]["model"] = model
                 is_check = "proof" in req["request"]
                 # Mark running
@@ -142,7 +156,7 @@ class RunnerExecutor:
                             ChatExecutor().check([req["request"]["input"]],[req["request"]["proof"]], self.test_model_manager, on_finished)
                         else:
                             ChatExecutor().execute([req["request"]["input"]], self.test_model_manager, on_finished)
-                    elif model == DEEPSEEK_MODEL_CONFIG.model_name and self.transformers_model_managers:
+                    elif model == ACTIVE_MODEL_CONFIG.model_name and self.transformers_model_managers:
                         # Continuous submission
                         print(f"🟢 Dispatching transformers request {req['uuid']} {request_id}")
                         input_json = req["request"]["input"]
