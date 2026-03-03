@@ -76,6 +76,8 @@ class TransformersModelManager:
         if self.model_config.tokenizer_kwargs.get("chat_template") is not None:
             self.tokenizer.chat_template = self.model_config.tokenizer_kwargs["chat_template"]
 
+        self.current_gpu_model = None
+
         # Load model
         print(f"Loading model {self.model_name} to device {self.force_device or self.device}")
         load_dtype = torch.float16# if self.device == 'cuda' else torch.float32
@@ -192,35 +194,70 @@ class TransformersModelManager:
                 if not alloc_conf or 'expandable_segments' not in alloc_conf:
                     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-            device_map_env = os.getenv("DEVICE_MAP", "auto")
-            print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-            try:
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_config.model_name,
-                    device_map=device_map_env,
-                    max_memory=max_memory,
-                    torch_dtype=load_dtype,
-                    cache_dir=MODELS_FOLDER,
-                    **self.model_config.model_kwargs
-                )
-            except Exception as e:
-                print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
-                # Clean up any partial model state and GPU memory before retry
+            use_accelerate_multigpu = (
+                has_quantization and
+                torch.cuda.is_available() and
+                torch.cuda.device_count() > 1 and
+                os.getenv("DEVICE_MAP", "auto") == "auto"
+            )
+
+            if use_accelerate_multigpu:
                 try:
-                    del self.current_gpu_model
-                except AttributeError:
-                    pass
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_config.model_name,
-                    device_map='auto',
-                    torch_dtype=load_dtype,
-                    cache_dir=MODELS_FOLDER,
-                    **self.model_config.model_kwargs
-                )
+                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
+                    from huggingface_hub import snapshot_download  # type: ignore
+
+                    local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
+                    cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
+                    with init_empty_weights():
+                        empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
+
+                    device_map_value = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
+                    dispatch_kwargs = {
+                        "device_map": device_map_value,
+                        "max_memory": max_memory,
+                        "dtype": load_dtype,
+                        "no_split_module_classes": self.model_config.model_kwargs.get("no_split_module_classes"),
+                    }
+                    self.current_gpu_model = load_checkpoint_and_dispatch(
+                        empty_model,
+                        checkpoint=local_dir,
+                        **{k: v for k, v in dispatch_kwargs.items() if v is not None}
+                    )
+                    print(f"[model-load] Loaded via Accelerate multi-GPU dispatcher (device_map={device_map_value})")
+                except Exception as accel_err:
+                    self.current_gpu_model = None
+                    print(f"[model-load] Accelerate multi-GPU path failed ({accel_err}); falling back to AutoModel loader")
+
+            if self.current_gpu_model is None:
+                device_map_env = os.getenv("DEVICE_MAP", "auto")
+                print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+                try:
+                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        device_map=device_map_env,
+                        max_memory=max_memory,
+                        torch_dtype=load_dtype,
+                        cache_dir=MODELS_FOLDER,
+                        **self.model_config.model_kwargs
+                    )
+                except Exception as e:
+                    print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+                    # Clean up any partial model state and GPU memory before retry
+                    try:
+                        del self.current_gpu_model
+                    except AttributeError:
+                        pass
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        device_map='auto',
+                        torch_dtype=load_dtype,
+                        cache_dir=MODELS_FOLDER,
+                        **self.model_config.model_kwargs
+                    )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
         # and no forced device pinning was requested
