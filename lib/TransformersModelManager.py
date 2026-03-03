@@ -145,15 +145,20 @@ class TransformersModelManager:
                 if num_gpus > 1:
                     has_quantization = 'quantization_config' in self.model_config.model_kwargs
                     if has_quantization:
-                        # Quantized models: modern accelerate (transformers 4.37+) uses the quantized
-                        # size for device_map planning when BitsAndBytesConfig is provided.
-                        # Use actual GPU VRAM with 2GiB headroom for KV cache / activations.
-                        # For 2x RTX 4090 (24GiB each): 4-bit 35B model ~20GB total fits easily.
+                        # Quantized models with hybrid architectures (e.g. Qwen3.5-35B-A3B) have
+                        # ~57% actual GPU usage vs BF16 budget (mix of 4-bit + non-quantizable BF16).
+                        # accelerate uses BF16 sizes for planning, so we need total budget > BF16 model
+                        # size to prevent CPU dispatch, but must keep actual usage within physical VRAM.
+                        #
+                        # For RTX 4090 (24GiB): budget=37GiB → actual~21GiB < 24GiB (no OOM)
+                        #                       total=74GiB > 70GB BF16 (no CPU dispatch)
+                        # Formula: 1.55x actual VRAM (actual usage ≈ 0.57 × budget → 0.57×1.55 = 88%)
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            max_memory[i] = f"{total_gb - 2}GiB"
-                        print(f"[model-load] Quantized model: using actual max_memory={max_memory} (modern accelerate uses 4-bit sizes for planning)")
+                            inflated_gib = int(total_gb * 1.55)
+                            max_memory[i] = f"{inflated_gib}GiB"
+                        print(f"[model-load] Quantized model: using inflated max_memory={max_memory} (1.55x VRAM to prevent CPU dispatch while avoiding OOM)")
                     else:
                         # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
                         max_memory = {}
