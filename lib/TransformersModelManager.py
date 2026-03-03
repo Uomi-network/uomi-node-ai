@@ -86,6 +86,11 @@ class TransformersModelManager:
             # do not overwrite if user already passed something explicitly
             self.model_config.model_kwargs.setdefault("attn_implementation", attn_impl)
 
+        has_quantization = 'quantization_config' in self.model_config.model_kwargs
+        if has_quantization:
+            # Ensure transformers streams weights per layer instead of duplicating them in GPU memory
+            self.model_config.model_kwargs.setdefault("low_cpu_mem_usage", True)
+
         # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
         max_memory_env = os.getenv("MAX_MEMORY")
         max_memory = None
@@ -155,7 +160,6 @@ class TransformersModelManager:
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    has_quantization = 'quantization_config' in self.model_config.model_kwargs
                     if has_quantization:
                         # Quantized models with hybrid architectures (e.g. Qwen3.5-35B-A3B) have
                         # ~57% actual GPU usage vs BF16 budget (mix of 4-bit + non-quantizable BF16).
