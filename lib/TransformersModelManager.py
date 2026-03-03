@@ -38,7 +38,7 @@ class TransformersModelConfig:
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
-    quantized_max_memory_multiplier: float = 1.55  # Planning headroom for quantized models (per GPU)
+    quantized_max_memory_multiplier: float = 1.82  # Planning headroom for quantized models (per GPU)
 
 class TransformersModelManager:
     def __init__(self, model_config: TransformersModelConfig, force_device: str | None = None):
