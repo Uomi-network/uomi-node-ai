@@ -143,11 +143,11 @@ class TransformersModelManager:
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    # Leave 2GiB per GPU as headroom for KV cache and CUDA kernels
+                    # Leave 1GiB per GPU as headroom; non-quantized layers can offload to CPU
                     max_memory = {}
                     for i in range(num_gpus):
                         total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                        max_memory[i] = f"{total_gb - 2}GiB"
+                        max_memory[i] = f"{total_gb - 1}GiB"
                     print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
 
             device_map_env = os.getenv("DEVICE_MAP", "auto")
@@ -640,7 +640,10 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
         # Requires: pip install bitsandbytes accelerate
         # Released: February 24, 2026
-        'quantization_config': BitsAndBytesConfig(load_in_8bit=True),
+        'quantization_config': BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,  # Allow embedding/norm layers to stay on CPU in fp32
+        ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
     tokenizer_kwargs={},  # Qwen3.5 includes enable_thinking support in its default chat template
