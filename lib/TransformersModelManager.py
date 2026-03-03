@@ -139,11 +139,16 @@ class TransformersModelManager:
                 print(f"[model-load] Accelerate path failed ({e}); no CPU fallback allowed - failing startup")
                 raise RuntimeError(f"Failed to load model on GPU {self.force_device} without CPU usage: {e}")
         else:
-            # Don't auto-set max_memory - it may cause CPU offload; use only if explicitly provided via env
+            # Auto-set max_memory for multi-GPU to ensure proper distribution without CPU offload
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    print(f"[model-load] Auto-detected {num_gpus} GPUs, device_map will distribute automatically")
+                    # Leave 2GiB per GPU as headroom for KV cache and CUDA kernels
+                    max_memory = {}
+                    for i in range(num_gpus):
+                        total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
+                        max_memory[i] = f"{total_gb - 2}GiB"
+                    print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
 
             device_map_env = os.getenv("DEVICE_MAP", "auto")
             print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
@@ -373,8 +378,9 @@ class TransformersModelManager:
             
         # Tokenize all inputs (left-padded) and keep attention mask to avoid warning
         tokenized = tokenizer(texts, padding=True, return_tensors="pt")
-        batch_input_ids = tokenized.input_ids.to(self.device)
-        attention_mask = tokenized.attention_mask.to(self.device)
+        input_device = self._resolve_input_device()
+        batch_input_ids = tokenized.input_ids.to(input_device)
+        attention_mask = tokenized.attention_mask.to(input_device)
         
         # Setup generation parameters
         max_new_tokens = int(os.getenv("SMOKE_MAX_NEW_TOKENS", TRANSFORMERS_INFERENCE_MAX_TOKENS))
@@ -529,14 +535,15 @@ class TransformersModelManager:
 
         # Pad sequences to the same length for batch processing
         max_len = max(len(ids) for ids in full_input_ids)
+        input_device = self._resolve_input_device()
         padded_input_ids = torch.stack([
             torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=ids.dtype)])
             for ids in full_input_ids
-        ]).to(self.current_gpu_model.device)
+        ]).to(input_device)
         padded_attention_masks = torch.stack([
             torch.cat([mask, torch.zeros(max_len - len(mask), dtype=mask.dtype)])
             for mask in full_attention_masks
-        ]).to(self.current_gpu_model.device)
+        ]).to(input_device)
 
         # Perform a single forward pass to get all logits
         with torch.no_grad():
@@ -622,6 +629,22 @@ class TransformersModelManager:
     def get_tokenizer(self, _model_name: str | None = None):
         return self.tokenizer
 
+
+QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
+    model_name='Qwen/Qwen3.5-35B-A3B',
+    deterministic=False,
+    location='gpu',
+    keep_in_memory=True,
+    model_kwargs={
+        'use_cache': True,
+        # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
+        # MoE: 35B total params but only 3B active per forward pass → very fast inference
+        # Requires: pip install bitsandbytes accelerate
+        # Released: February 24, 2026
+        'quantization_config': BitsAndBytesConfig(load_in_8bit=True),
+    },
+    tokenizer_kwargs={},  # Qwen3.5 includes enable_thinking support in its default chat template
+)
 
 DEEPSEEK_MODEL_CONFIG = TransformersModelConfig(
     model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
