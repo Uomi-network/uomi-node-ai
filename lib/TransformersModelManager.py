@@ -222,6 +222,16 @@ class TransformersModelManager:
                         empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
 
                     device_map_value = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
+                    if device_map_value == "balanced_low_0":
+                        # Qwen3.5 MoE keeps repeating GPU0 allocations when using the built-in balanced maps.
+                        # Define a deterministic round-robin map that alternates dense/expert blocks between GPUs.
+                        block_map: Dict[str, str] = {}
+                        current_gpu = 0
+                        for name in cfg._name_or_path_modules if hasattr(cfg, '_name_or_path_modules') else []:
+                            block_map[name] = f"cuda:{current_gpu}"
+                            current_gpu = (current_gpu + 1) % torch.cuda.device_count()
+                        if block_map:
+                            device_map_value = block_map
                     dispatch_kwargs = {
                         "device_map": device_map_value,
                         "max_memory": max_memory,
