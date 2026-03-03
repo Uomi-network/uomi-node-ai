@@ -221,17 +221,25 @@ class TransformersModelManager:
                     with init_empty_weights():
                         empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
 
-                    device_map_value = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
-                    if device_map_value == "balanced_low_0":
+                    device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
+                    if isinstance(device_map_value, str) and device_map_value == "balanced_low_0":
                         # Qwen3.5 MoE keeps repeating GPU0 allocations when using the built-in balanced maps.
-                        # Define a deterministic round-robin map that alternates dense/expert blocks between GPUs.
+                        # Define a deterministic round-robin map over transformer blocks so expert shards
+                        # are evenly split without ever requesting >1GiB contiguous chunks on a single GPU.
                         block_map: Dict[str, str] = {}
                         current_gpu = 0
-                        for name in cfg._name_or_path_modules if hasattr(cfg, '_name_or_path_modules') else []:
-                            block_map[name] = f"cuda:{current_gpu}"
+                        module_prefix = getattr(cfg, 'architectures', [''])[0] if getattr(cfg, 'architectures', None) else ''
+                        total_layers = getattr(cfg, 'num_hidden_layers', 0)
+                        for layer_idx in range(total_layers):
+                            key = f"model.layers.{layer_idx}"
+                            block_map[key] = f"cuda:{current_gpu}"
                             current_gpu = (current_gpu + 1) % torch.cuda.device_count()
-                        if block_map:
-                            device_map_value = block_map
+                        # Ensure the embedding and lm_head live on GPU0 to avoid host/device transfers
+                        embed_key = f"{module_prefix}.embed_tokens" if module_prefix else "model.embed_tokens"
+                        head_key = f"{module_prefix}.lm_head" if module_prefix else "lm_head"
+                        block_map[embed_key] = "cuda:0"
+                        block_map[head_key] = "cuda:0"
+                        device_map_value = block_map
                     dispatch_kwargs = {
                         "device_map": device_map_value,
                         "max_memory": max_memory,
