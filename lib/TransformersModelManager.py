@@ -145,10 +145,13 @@ class TransformersModelManager:
                 if num_gpus > 1:
                     has_quantization = 'quantization_config' in self.model_config.model_kwargs
                     if has_quantization:
-                        # Quantized models (4-bit ~18-22GB, 8-bit ~36GB) are much smaller than BF16.
-                        # Do NOT set max_memory: accelerate estimates memory from BF16 disk size (~72GB)
-                        # and would dispatch layers to CPU. Let device_map='auto' use full GPU VRAM freely.
-                        print(f"[model-load] Quantized model on {num_gpus} GPUs: skipping max_memory (model fits in VRAM)")
+                        # Quantized models: accelerate estimates VRAM from BF16 disk size (~70GB for 35B),
+                        # NOT from the actual 4-bit quantized size (~20GB). With real VRAM ~48GB < 70GB,
+                        # accelerate would dispatch layers to CPU and bitsandbytes would crash.
+                        # Fix: tell accelerate each GPU has 40GiB available → 80GiB total > 70GB BF16.
+                        # The actual 4-bit weights (~10GB/GPU) fit easily, so no real OOM occurs.
+                        max_memory = {i: '40GiB' for i in range(num_gpus)}
+                        print(f"[model-load] Quantized model: using inflated max_memory={max_memory} to prevent CPU dispatch (actual 4-bit size << BF16 estimate)")
                     else:
                         # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
                         max_memory = {}
