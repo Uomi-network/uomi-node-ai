@@ -190,9 +190,14 @@ class TransformersModelManager:
 
             # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF')
-                if not alloc_conf or 'expandable_segments' not in alloc_conf:
-                    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+                alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
+                alloc_parts = [part for part in alloc_conf.split(',') if part]
+                if 'expandable_segments' not in alloc_conf:
+                    alloc_parts.append('expandable_segments:True')
+                if 'max_split_size_mb' not in alloc_conf:
+                    max_split_mb = os.getenv('PYTORCH_MAX_SPLIT_MB', '256')
+                    alloc_parts.append(f'max_split_size_mb:{max_split_mb}')
+                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(alloc_parts)
 
             use_accelerate_multigpu = (
                 has_quantization and
