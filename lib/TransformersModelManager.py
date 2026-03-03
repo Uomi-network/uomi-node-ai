@@ -641,8 +641,10 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         # Requires: pip install bitsandbytes accelerate
         # Released: February 24, 2026
         'quantization_config': BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_enable_fp32_cpu_offload=True,  # Allow embedding/norm layers to stay on CPU in fp32
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",          # Normal Float 4: better quality than standard int4
+            bnb_4bit_use_double_quant=True,     # Nested quantization: extra ~0.4 bits saved
         ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
