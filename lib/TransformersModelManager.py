@@ -38,6 +38,7 @@ class TransformersModelConfig:
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
+    quantized_max_memory_multiplier: float = 1.55  # Planning headroom for quantized models (per GPU)
 
 class TransformersModelManager:
     def __init__(self, model_config: TransformersModelConfig, force_device: str | None = None):
@@ -86,6 +87,15 @@ class TransformersModelManager:
         # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
         max_memory_env = os.getenv("MAX_MEMORY")
         max_memory = None
+        # Allow overriding the quantized multiplier (used when no explicit MAX_MEMORY is set)
+        quantized_max_memory_multiplier = self.model_config.quantized_max_memory_multiplier
+        multiplier_env = os.getenv("MAX_MEMORY_MULTIPLIER")
+        if multiplier_env:
+            try:
+                # Keep sanity floor at 1.0 to avoid shrinking below physical VRAM
+                quantized_max_memory_multiplier = max(1.0, float(multiplier_env))
+            except ValueError:
+                print(f"[model-load] Ignoring invalid MAX_MEMORY_MULTIPLIER='{multiplier_env}' (expected float)")
         if max_memory_env:
             try:
                 max_memory = {}
@@ -156,9 +166,12 @@ class TransformersModelManager:
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            inflated_gib = int(total_gb * 1.55)
+                            inflated_gib = int(total_gb * quantized_max_memory_multiplier)
                             max_memory[i] = f"{inflated_gib}GiB"
-                        print(f"[model-load] Quantized model: using inflated max_memory={max_memory} (1.55x VRAM to prevent CPU dispatch while avoiding OOM)")
+                        print(
+                            "[model-load] Quantized model: using inflated max_memory="
+                            f"{max_memory} ({quantized_max_memory_multiplier:.2f}x VRAM to prevent CPU dispatch while avoiding OOM)"
+                        )
                     else:
                         # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
                         max_memory = {}
@@ -661,6 +674,7 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
     deterministic=False,
     location='gpu',
     keep_in_memory=True,
+    quantized_max_memory_multiplier=1.75,
     model_kwargs={
         # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
