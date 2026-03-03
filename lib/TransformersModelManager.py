@@ -208,6 +208,11 @@ class TransformersModelManager:
 
                     local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
                     cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
+                    # Some newer MoE configs (e.g. Qwen3.5) omit vocab_size; infer from tokenizer to satisfy HF loader
+                    if not getattr(cfg, 'vocab_size', None):
+                        inferred_vocab = len(self.tokenizer)
+                        setattr(cfg, 'vocab_size', inferred_vocab)
+                        print(f"[model-load] Inferred missing vocab_size={inferred_vocab} for {cfg.__class__.__name__}")
                     with init_empty_weights():
                         empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
 
