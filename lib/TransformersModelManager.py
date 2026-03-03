@@ -1,6 +1,8 @@
-import torch
-import time
+import math
 import os
+import time
+
+import torch
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
@@ -166,7 +168,7 @@ class TransformersModelManager:
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            inflated_gib = int(total_gb * quantized_max_memory_multiplier)
+                            inflated_gib = math.ceil(total_gb * quantized_max_memory_multiplier)
                             max_memory[i] = f"{inflated_gib}GiB"
                         print(
                             "[model-load] Quantized model: using inflated max_memory="
@@ -179,6 +181,12 @@ class TransformersModelManager:
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
                             max_memory[i] = f"{total_gb - 1}GiB"
                         print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
+
+            # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF')
+                if not alloc_conf or 'expandable_segments' not in alloc_conf:
+                    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
             device_map_env = os.getenv("DEVICE_MAP", "auto")
             print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
@@ -674,7 +682,7 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
     deterministic=False,
     location='gpu',
     keep_in_memory=True,
-    quantized_max_memory_multiplier=1.75,
+    quantized_max_memory_multiplier=1.82,
     model_kwargs={
         # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
