@@ -145,13 +145,15 @@ class TransformersModelManager:
                 if num_gpus > 1:
                     has_quantization = 'quantization_config' in self.model_config.model_kwargs
                     if has_quantization:
-                        # Quantized models: accelerate estimates VRAM from BF16 disk size (~70GB for 35B),
-                        # NOT from the actual 4-bit quantized size (~20GB). With real VRAM ~48GB < 70GB,
-                        # accelerate would dispatch layers to CPU and bitsandbytes would crash.
-                        # Fix: tell accelerate each GPU has 40GiB available → 80GiB total > 70GB BF16.
-                        # The actual 4-bit weights (~10GB/GPU) fit easily, so no real OOM occurs.
-                        max_memory = {i: '40GiB' for i in range(num_gpus)}
-                        print(f"[model-load] Quantized model: using inflated max_memory={max_memory} to prevent CPU dispatch (actual 4-bit size << BF16 estimate)")
+                        # Quantized models: modern accelerate (transformers 4.37+) uses the quantized
+                        # size for device_map planning when BitsAndBytesConfig is provided.
+                        # Use actual GPU VRAM with 2GiB headroom for KV cache / activations.
+                        # For 2x RTX 4090 (24GiB each): 4-bit 35B model ~20GB total fits easily.
+                        max_memory = {}
+                        for i in range(num_gpus):
+                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
+                            max_memory[i] = f"{total_gb - 2}GiB"
+                        print(f"[model-load] Quantized model: using actual max_memory={max_memory} (modern accelerate uses 4-bit sizes for planning)")
                     else:
                         # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
                         max_memory = {}
@@ -167,16 +169,25 @@ class TransformersModelManager:
                     self.model_config.model_name,
                     device_map=device_map_env,
                     max_memory=max_memory,
-                    dtype=load_dtype,
+                    torch_dtype=load_dtype,
                     cache_dir=MODELS_FOLDER,
                     **self.model_config.model_kwargs
                 )
             except Exception as e:
                 print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+                # Clean up any partial model state and GPU memory before retry
+                try:
+                    del self.current_gpu_model
+                except AttributeError:
+                    pass
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                     self.model_config.model_name,
                     device_map='auto',
-                    dtype=load_dtype,
+                    torch_dtype=load_dtype,
                     cache_dir=MODELS_FOLDER,
                     **self.model_config.model_kwargs
                 )
@@ -655,7 +666,6 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",                    # Normal Float 4: better quality than standard int4
             bnb_4bit_use_double_quant=True,               # Nested quantization: extra ~0.4 bits saved
-            llm_int8_enable_fp32_cpu_offload=True,        # Allow embedding/lm_head on CPU if needed
         ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
