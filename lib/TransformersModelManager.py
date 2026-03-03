@@ -124,7 +124,7 @@ class TransformersModelManager:
                 # Zero-CPU load: initialize empty model on meta and dispatch weights directly to GPU
                 cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
                 with init_empty_weights():
-                    empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
+                    empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
                 with torch.cuda.device(gid):
                     self.current_gpu_model = load_checkpoint_and_dispatch(
                         empty_model,
@@ -157,7 +157,7 @@ class TransformersModelManager:
                     self.model_config.model_name,
                     device_map=device_map_env,
                     max_memory=max_memory,
-                    torch_dtype=load_dtype,
+                    dtype=load_dtype,
                     cache_dir=MODELS_FOLDER,
                     **self.model_config.model_kwargs
                 )
@@ -166,7 +166,7 @@ class TransformersModelManager:
                 self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                     self.model_config.model_name,
                     device_map='auto',
-                    torch_dtype=load_dtype,
+                    dtype=load_dtype,
                     cache_dir=MODELS_FOLDER,
                     **self.model_config.model_kwargs
                 )
@@ -636,7 +636,6 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
     location='gpu',
     keep_in_memory=True,
     model_kwargs={
-        'use_cache': True,
         # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
         # Requires: pip install bitsandbytes accelerate
