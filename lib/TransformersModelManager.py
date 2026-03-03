@@ -642,6 +642,7 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         # Requires: pip install bitsandbytes accelerate
         # Released: February 24, 2026
         'quantization_config': BitsAndBytesConfig(load_in_8bit=True),
+        'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
     tokenizer_kwargs={},  # Qwen3.5 includes enable_thinking support in its default chat template
 )
