@@ -49,6 +49,16 @@ class VLLMModelManager:
     def __init__(self, model_config: VLLMModelConfig):
         from vllm import LLM  # type: ignore
 
+        # vLLM sets multiprocessing start method to 'spawn' which causes worker processes
+        # to re-import the main module — crashing if there's no if __name__=='__main__' guard.
+        # Force 'fork' before LLM() is created. Safe on Linux as long as no CUDA context
+        # exists yet in the parent (vLLM creates CUDA contexts only inside workers).
+        import multiprocessing
+        try:
+            multiprocessing.set_start_method('fork', force=True)
+        except RuntimeError:
+            pass  # already set, ignore
+
         # Qwen3_5MoeForCausalLM may exist in the codebase but not yet be registered
         # in the vLLM model registry (nightly builds lag behind main). Register it now.
         try:
