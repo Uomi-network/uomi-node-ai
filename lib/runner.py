@@ -176,13 +176,16 @@ class RunnerExecutor:
                         enable_thinking = payload.get("enable_thinking", req["request"].get("enable_thinking", True))
                         # Allow optional per-request sampling / max tokens overrides
                         sampling_cfg = payload.get("sampling", {"temperature":0.7, "top_k":5})
-                        # Determine max_new_tokens with safe cap (env var MAX_NEW_TOKENS, default 128)
+                        # Determine max_new_tokens with safe cap.
+                        # Default is intentionally conservative to avoid minute-long generations
+                        # when callers omit max_new_tokens.
                         req_max_new = req["request"].get("max_new_tokens") or payload.get("max_new_tokens")
                         try:
-                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", f"{TRANSFORMERS_INFERENCE_MAX_TOKENS}"))
+                            max_new_tokens = int(req_max_new) if req_max_new is not None else int(os.getenv("MAX_NEW_TOKENS", "256"))
                         except Exception:
-                            max_new_tokens = TRANSFORMERS_INFERENCE_MAX_TOKENS
+                            max_new_tokens = 256
                         max_new_tokens = max(1, min(max_new_tokens, TRANSFORMERS_INFERENCE_MAX_TOKENS))  # hard cap to protect CPU/GPU
+                        print(f"[request] request_id={request_id} max_new_tokens={max_new_tokens} enable_thinking={enable_thinking}")
                         if is_check:
                             # unzip proof
                             from lib.zipper import unzip_string
