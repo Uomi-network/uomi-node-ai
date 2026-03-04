@@ -103,7 +103,6 @@ class VLLMModelManager:
             "--gpu-memory-utilization", str(cfg.gpu_memory_utilization),
             "--port", str(cfg.port),
             "--trust-remote-code",
-            "--disable-log-requests",
         ]
         if cfg.hf_overrides:
             cmd += ["--hf-overrides", json.dumps(cfg.hf_overrides)]
