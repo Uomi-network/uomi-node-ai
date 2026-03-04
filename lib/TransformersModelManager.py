@@ -200,15 +200,22 @@ class TransformersModelManager:
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
                             if uses_compressed_dtype:
-                                # Inflate to 2× physical: forces Accelerate's BF16 estimate (~72 GB)
-                                # to fit across GPUs without any disk offload.
-                                budget_gib = total_gb * 2
+                                # Accelerate plans device placement using the BF16 size of each layer
+                                # (2 bytes/param), not the FP8 size (1 byte/param). For a 35B-param
+                                # FP8 model, Accelerate sees ~70 GiB, but the actual loaded size is
+                                # ~37.5 GB. We inflate the per-GPU budget so the BF16 estimate fits
+                                # entirely on GPU with no disk offload.
+                                #
+                                # 1.6× keeps actual FP8 usage at ~18.5 GiB on GPU 0 (vs 23+ GiB with
+                                # 2×), leaving ~5 GiB headroom for CUDA context + MoE merge buffers.
+                                # 2× was too aggressive: GPU 0 filled to 23.15 GiB → OOM at last alloc.
+                                budget_gib = math.ceil(total_gb * 1.6)
                                 max_memory[i] = f"{budget_gib}GiB"
                             else:
                                 # Standard non-quantized model: subtract 1 GiB headroom.
                                 max_memory[i] = f"{total_gb - 1}GiB"
                         print(f"[model-load] Auto-detected {num_gpus} GPUs "
-                              f"({'inflated for FP8/compressed dtype' if uses_compressed_dtype else 'standard'}), "
+                              f"({'inflated 1.6x for FP8/compressed dtype' if uses_compressed_dtype else 'standard'}), "
                               f"setting max_memory={max_memory}")
 
             # PYTORCH_CUDA_ALLOC_CONF (expandable_segments, max_split_size_mb) is set
