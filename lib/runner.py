@@ -62,6 +62,7 @@ class RunnerExecutor:
         print('Initialize RunnerExecutor')
         self.kill = False
         self.queue = queue
+        self.active_model_name = ACTIVE_MODEL_CONFIG.model_name
         # Micro-batching accumulation window in milliseconds (set 0 to disable)
         self.microbatch_window_ms = 30
         self.test_model_manager = TestModelManager(TEST_MODEL_CONFIG)
@@ -92,14 +93,36 @@ class RunnerExecutor:
                 if max_replicas > 0:
                     target_gpus = target_gpus[:max_replicas]
                 if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG or ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
-                    # Multi-GPU model: single instance distributed across all GPUs via device_map='auto'
-                    print(f"🔧 Spawning single multi-GPU instance of {ACTIVE_MODEL_CONFIG.model_name} across {len(target_gpus)} GPU(s)")
-                    try:
-                        tm = TransformersModelManager(ACTIVE_MODEL_CONFIG)
-                        tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
-                        self.transformers_model_managers.append(tm)
-                    except Exception as e:
-                        print(f"❌ Failed to spawn multi-GPU instance: {e}")
+                    # Multi-GPU model: single instance distributed across all GPUs.
+                    # If FP8 fails to load in this environment, optionally fall back to BnB 4-bit.
+                    candidate_configs = [ACTIVE_MODEL_CONFIG]
+                    allow_fallback = os.getenv("QWEN_FALLBACK_ON_LOAD_FAILURE", "1") == "1"
+                    if allow_fallback and ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
+                        candidate_configs.append(QWEN35_35B_A3B_MODEL_CONFIG)
+
+                    last_error = None
+                    for cfg in candidate_configs:
+                        print(f"🔧 Spawning single multi-GPU instance of {cfg.model_name} across {len(target_gpus)} GPU(s)")
+                        try:
+                            tm = TransformersModelManager(cfg)
+                            tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                            self.transformers_model_managers.append(tm)
+                            self.active_model_name = cfg.model_name
+                            if cfg is not ACTIVE_MODEL_CONFIG:
+                                print(f"⚠️  Falling back from {ACTIVE_MODEL_CONFIG.model_name} to {cfg.model_name}")
+                            break
+                        except Exception as e:
+                            last_error = e
+                            print(f"❌ Failed to spawn multi-GPU instance ({cfg.model_name}): {e}")
+                            try:
+                                import gc
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                    if not self.transformers_model_managers and last_error is not None:
+                        print(f"❌ All multi-GPU model load attempts failed. Last error: {last_error}")
                 else:
                     # Single-GPU model: one replica per GPU
                     for gid in target_gpus:
@@ -144,8 +167,8 @@ class RunnerExecutor:
             for req in sorted(pending, key=lambda r: r["timestamp_pending"]):
                 model = req["request"].get("model")
                 request_id = req['request'].get('request_id', 'unknown')
-                if model not in TEST_MODEL_CONFIG and model != ACTIVE_MODEL_CONFIG.model_name:
-                    model = ACTIVE_MODEL_CONFIG.model_name
+                if model not in TEST_MODEL_CONFIG and model != self.active_model_name:
+                    model = self.active_model_name
                     req["request"]["model"] = model
                 is_check = "proof" in req["request"]
                 # Mark running
@@ -166,7 +189,7 @@ class RunnerExecutor:
                             ChatExecutor().check([req["request"]["input"]],[req["request"]["proof"]], self.test_model_manager, on_finished)
                         else:
                             ChatExecutor().execute([req["request"]["input"]], self.test_model_manager, on_finished)
-                    elif model == ACTIVE_MODEL_CONFIG.model_name and self.transformers_model_managers:
+                    elif model == self.active_model_name and self.transformers_model_managers:
                         # Continuous submission
                         print(f"🟢 Dispatching transformers request {req['uuid']} {request_id}")
                         input_json = req["request"]["input"]
