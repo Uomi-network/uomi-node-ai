@@ -303,7 +303,9 @@ class TransformersModelManager:
                         **self.model_config.model_kwargs,
                     )
                 else:
-                    device_map_env = os.getenv("DEVICE_MAP", "auto")
+                    # 'balanced' spreads layers evenly across GPUs so no single GPU
+                    # gets overloaded during the MoE weight-merge step.
+                    device_map_env = os.getenv("DEVICE_MAP", "balanced")
                     print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
