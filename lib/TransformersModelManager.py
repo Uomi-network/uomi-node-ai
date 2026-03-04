@@ -40,7 +40,6 @@ class TransformersModelConfig:
     model_kwargs: Dict[str, Any]  # Additional kwargs for model loading
     tokenizer_kwargs: Dict[str, Any]  # Additional kwargs for tokenizer loading
     keep_in_memory: bool = False  # Whether to keep the model in memory after completion
-    quantized_max_memory_multiplier: float = 1.82  # Planning headroom for quantized models (per GPU)
 
 class TransformersModelManager:
     def __init__(self, model_config: TransformersModelConfig, force_device: str | None = None):
@@ -93,18 +92,15 @@ class TransformersModelManager:
             # Ensure transformers streams weights per layer instead of duplicating them in GPU memory
             self.model_config.model_kwargs.setdefault("low_cpu_mem_usage", True)
 
+        # Detect bitsandbytes quantization: load_checkpoint_and_dispatch cannot apply bnb quantization
+        # (it loads raw FP16 weights). BnB quantization MUST go through AutoModelForCausalLM.from_pretrained.
+        is_bnb_quantized = has_quantization and isinstance(
+            self.model_config.model_kwargs.get('quantization_config'), BitsAndBytesConfig
+        )
+
         # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
         max_memory_env = os.getenv("MAX_MEMORY")
         max_memory = None
-        # Allow overriding the quantized multiplier (used when no explicit MAX_MEMORY is set)
-        quantized_max_memory_multiplier = self.model_config.quantized_max_memory_multiplier
-        multiplier_env = os.getenv("MAX_MEMORY_MULTIPLIER")
-        if multiplier_env:
-            try:
-                # Keep sanity floor at 1.0 to avoid shrinking below physical VRAM
-                quantized_max_memory_multiplier = max(1.0, float(multiplier_env))
-            except ValueError:
-                print(f"[model-load] Ignoring invalid MAX_MEMORY_MULTIPLIER='{multiplier_env}' (expected float)")
         if max_memory_env:
             try:
                 max_memory = {}
@@ -162,31 +158,19 @@ class TransformersModelManager:
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    if has_quantization:
-                        # Quantized models with hybrid architectures (e.g. Qwen3.5-35B-A3B) have
-                        # ~57% actual GPU usage vs BF16 budget (mix of 4-bit + non-quantizable BF16).
-                        # accelerate uses BF16 sizes for planning, so we need total budget > BF16 model
-                        # size to prevent CPU dispatch, but must keep actual usage within physical VRAM.
-                        #
-                        # For RTX 4090 (24GiB): budget=37GiB → actual~21GiB < 24GiB (no OOM)
-                        #                       total=74GiB > 70GB BF16 (no CPU dispatch)
-                        # Formula: 1.55x actual VRAM (actual usage ≈ 0.57 × budget → 0.57×1.55 = 88%)
-                        max_memory = {}
-                        for i in range(num_gpus):
-                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            inflated_gib = math.ceil(total_gb * quantized_max_memory_multiplier)
-                            max_memory[i] = f"{inflated_gib}GiB"
-                        print(
-                            "[model-load] Quantized model: using inflated max_memory="
-                            f"{max_memory} ({quantized_max_memory_multiplier:.2f}x VRAM to prevent CPU dispatch while avoiding OOM)"
-                        )
-                    else:
-                        # Non-quantized models: limit per-GPU to leave ~1GiB headroom for KV cache / OS
-                        max_memory = {}
-                        for i in range(num_gpus):
-                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            max_memory[i] = f"{total_gb - 1}GiB"
-                        print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
+                    max_memory = {}
+                    for i in range(num_gpus):
+                        total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
+                        if is_bnb_quantized:
+                            # BnB quantization is applied during from_pretrained; Accelerate accounts
+                            # for it when planning. Use 90% of physical VRAM to leave headroom for
+                            # KV cache and activations. Do NOT inflate beyond physical VRAM.
+                            safe_gib = math.floor(total_gb * 0.9)
+                        else:
+                            # Non-quantized: leave ~1GiB headroom
+                            safe_gib = total_gb - 1
+                        max_memory[i] = f"{safe_gib}GiB"
+                    print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
 
             # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -199,8 +183,12 @@ class TransformersModelManager:
                     alloc_parts.append(f'max_split_size_mb:{max_split_mb}')
                 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(alloc_parts)
 
+            # load_checkpoint_and_dispatch loads raw FP16/BF16 weights and cannot apply bitsandbytes
+            # quantization. For BnB-quantized models, quantization MUST happen inside from_pretrained.
+            # Using this path for a 35B model would require ~70GB (2x physical VRAM) and cause OOM.
             use_accelerate_multigpu = (
                 has_quantization and
+                not is_bnb_quantized and
                 torch.cuda.is_available() and
                 torch.cuda.device_count() > 1 and
                 os.getenv("DEVICE_MAP", "auto") == "auto"
@@ -254,6 +242,9 @@ class TransformersModelManager:
                     print(f"[model-load] Loaded via Accelerate multi-GPU dispatcher (device_map={device_map_value})")
                 except Exception as accel_err:
                     self.current_gpu_model = None
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
                     print(f"[model-load] Accelerate multi-GPU path failed ({accel_err}); falling back to AutoModel loader")
 
             if self.current_gpu_model is None:
@@ -751,7 +742,6 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
     deterministic=False,
     location='gpu',
     keep_in_memory=True,
-    quantized_max_memory_multiplier=1.82,
     model_kwargs={
         # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
