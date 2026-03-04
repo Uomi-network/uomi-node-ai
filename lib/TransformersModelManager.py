@@ -288,40 +288,43 @@ class TransformersModelManager:
                     from huggingface_hub import snapshot_download  # type: ignore
 
                     local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
+                    cfg = AutoConfig.from_pretrained(
+                        local_dir,
+                        cache_dir=MODELS_FOLDER,
+                        trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+                    )
 
-                    # Use from_pretrained inside init_empty_weights — this creates the full model
-                    # skeleton (all params on meta/empty device) without loading any weights.
-                    # Avoids from_config which fails for new MoE architectures that don't expose
-                    # hidden_size directly (e.g. Qwen3_5MoeConfig).
+                    # Build round-robin dict BEFORE from_config so we never ask accelerate to
+                    # auto-compute a device map (which reads hidden_size and fails for Qwen3_5MoeConfig).
+                    total_layers = int(getattr(cfg, 'num_hidden_layers', 0))
+                    if total_layers <= 0:
+                        raise RuntimeError(f"Cannot build device map: num_hidden_layers={total_layers}")
+                    n_gpus = torch.cuda.device_count()
+                    round_robin: Dict[str, str] = {
+                        f"model.layers.{i}": f"cuda:{i % n_gpus}" for i in range(total_layers)
+                    }
+                    round_robin["model.embed_tokens"] = "cuda:0"
+                    round_robin["model.norm"] = "cuda:0"
+                    round_robin["lm_head"] = "cuda:0"
+                    print(f"[model-load] Accelerate round-robin map: {total_layers} layers across {n_gpus} GPUs")
+
                     with init_empty_weights():
-                        empty_model = AutoModelForCausalLM.from_pretrained(
-                            local_dir,
+                        # from_config runs model __init__ on meta device — no weights loaded,
+                        # no _is_hf_initialized issues (that's a from_pretrained-only path).
+                        empty_model = AutoModelForCausalLM.from_config(
+                            cfg,
                             trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
                         )
 
-                    # Build round-robin device map: layer 0→GPU 0, layer 1→GPU 1, layer 2→GPU 0…
-                    # This guarantees no GPU receives more than half the layers.
-                    device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "auto")
-                    if device_map_value == "auto":
-                        rr_map = self._build_round_robin_device_map()
-                        if rr_map:
-                            device_map_value = rr_map
-                            print(f"[model-load] Accelerate round-robin map: {len(rr_map)} layer entries across {torch.cuda.device_count()} GPUs")
-
-                    dispatch_kwargs = {
-                        "device_map": device_map_value,
-                        "max_memory": max_memory,
-                        # For FP8: omit dtype so accelerate preserves native float8_e4m3fn weights.
-                        # Passing float16 would upcast to ~75 GB and OOM immediately.
-                        "dtype": None if is_fp8_checkpoint else load_dtype,
-                        "no_split_module_classes": self.model_config.model_kwargs.get("no_split_module_classes"),
-                    }
                     self.current_gpu_model = load_checkpoint_and_dispatch(
                         empty_model,
                         checkpoint=local_dir,
-                        **{k: v for k, v in dispatch_kwargs.items() if v is not None}
+                        device_map=round_robin,
+                        max_memory=max_memory,
+                        # FP8: omit dtype so weights stay float8_e4m3fn; float16 would upcast to ~75 GB.
+                        **({} if is_fp8_checkpoint else {"dtype": load_dtype}),
                     )
-                    print(f"[model-load] Loaded via Accelerate multi-GPU dispatcher (device_map={device_map_value})")
+                    print(f"[model-load] Loaded via Accelerate load_checkpoint_and_dispatch")
                 except Exception as accel_err:
                     self.current_gpu_model = None
                     import gc
