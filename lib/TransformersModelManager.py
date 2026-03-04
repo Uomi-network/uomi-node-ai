@@ -20,10 +20,6 @@ import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
-try:
-    from transformers import AutoModelForVision2Seq  # available in transformers >= 4.34
-except ImportError:
-    AutoModelForVision2Seq = None  # type: ignore
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
 from transformers import (
@@ -326,42 +322,15 @@ class TransformersModelManager:
                 else:
                     device_map_env = os.getenv("DEVICE_MAP", "auto")
                     print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-                    # Try AutoModelForVision2Seq first so that VLM checkpoints (e.g. Qwen3.5-A3B-FP8)
-                    # have ALL their weights (visual encoder, MTP heads, expert layers) properly
-                    # distributed by Accelerate across all GPUs.  If loaded with AutoModelForCausalLM,
-                    # those "unexpected" tensors pile up temporarily on a single GPU and cause OOM
-                    # during the MoE expert-merge (MergeModulelist / torch.stack) step.
-                    _load_kwargs = dict(
+                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
                         device_map=device_map_env,
                         max_memory=max_memory,
                         cache_dir=MODELS_FOLDER,
                         **dtype_kwargs,
                         **self.model_config.model_kwargs,
                     )
-                    _loaded = False
-                    for _ModelCls in filter(None, (AutoModelForVision2Seq, AutoModelForCausalLM)):
-                        try:
-                            self.current_gpu_model = _ModelCls.from_pretrained(
-                                self.model_config.model_name, **_load_kwargs
-                            )
-                            print(f"[model-load] Loaded with {_ModelCls.__name__}")
-                            _loaded = True
-                            break
-                        except Exception as _e:
-                            print(f"[model-load] {_ModelCls.__name__} failed: {_e}")
-                            try:
-                                del self.current_gpu_model
-                            except AttributeError:
-                                pass
-                            import gc
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                    if not _loaded:
-                        raise RuntimeError(
-                            f"All model classes failed to load {self.model_config.model_name}. "
-                            "Check VRAM, model name, and transformers version."
-                        )
+                    print(f"[model-load] Loaded with AutoModelForCausalLM")
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
         # and no forced device pinning was requested
