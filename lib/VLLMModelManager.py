@@ -246,16 +246,29 @@ class VLLMModelManager:
             top_k = int(sampling_cfg.get("top_k", 5))
             n_tokens = len(forced_tokens) if (is_check and forced_tokens) else max_new_tokens
 
+            # Qwen3 thinking mode is controlled via the system message:
+            #   enable_thinking=True  → no special injection (model thinks by default)
+            #   enable_thinking=False → prepend "/no_think" system message
+            # We do NOT use chat_template_kwargs because vLLM serve may ignore it silently.
+            patched_messages = list(messages)
+            if not enable_thinking:
+                # Check if there's already a system message
+                if patched_messages and patched_messages[0].get("role") == "system":
+                    existing = patched_messages[0].get("content", "")
+                    # Only add /no_think if not already present
+                    if "/no_think" not in existing:
+                        patched_messages = [{"role": "system", "content": existing + "\n/no_think"}] + patched_messages[1:]
+                else:
+                    patched_messages = [{"role": "system", "content": "/no_think"}] + patched_messages
+
             payload: Dict[str, Any] = {
                 "model": self.model_name,
-                "messages": messages,
+                "messages": patched_messages,
                 "max_tokens": n_tokens,
                 "temperature": temperature,
                 "top_k": top_k,
                 "stream": False,
             }
-            if enable_thinking:
-                payload["chat_template_kwargs"] = {"enable_thinking": True}
 
             body = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
