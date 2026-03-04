@@ -125,18 +125,15 @@ class RunnerExecutor:
                     if not self.transformers_model_managers and last_error is not None:
                         print(f"❌ All multi-GPU model load attempts failed. Last error: {last_error}")
                 elif ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG:
-                    # BnB 4-bit path: one full replica per GPU for real parallel throughput.
+                    # BnB 8-bit path: single instance distributed across all GPUs (~35GB across 2x 4090).
                     self.active_model_name = ACTIVE_MODEL_CONFIG.model_name
-                    for gid in target_gpus:
-                        dev = f"cuda:{gid}"
-                        print(f"🔧 Spawning BnB model replica on {dev}")
-                        try:
-                            tm = TransformersModelManager(ACTIVE_MODEL_CONFIG, force_device=dev)
-                            tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
-                            self.transformers_model_managers.append(tm)
-                        except Exception as e:
-                            print(f"❌ Failed to spawn BnB replica on {dev}: {e}")
-                            continue
+                    print(f"🔧 Spawning single BnB 8-bit instance across {len(target_gpus)} GPU(s)")
+                    try:
+                        tm = TransformersModelManager(ACTIVE_MODEL_CONFIG)
+                        tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                        self.transformers_model_managers.append(tm)
+                    except Exception as e:
+                        print(f"❌ Failed to spawn BnB multi-GPU instance: {e}")
                 else:
                     # Single-GPU model: one replica per GPU
                     for gid in target_gpus:

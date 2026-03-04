@@ -961,15 +961,12 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
     location='gpu',
     keep_in_memory=True,
     model_kwargs={
-        # INT8 quantization via bitsandbytes: ~36GB across 2x RTX 4090 (48GB total)
+        # INT8 quantization via bitsandbytes: ~35GB across 2x RTX 4090 (48GB total)
         # MoE: 35B total params but only 3B active per forward pass → very fast inference
         # Requires: pip install bitsandbytes accelerate
         # Released: February 24, 2026
         'quantization_config': BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",                    # Normal Float 4: better quality than standard int4
-            bnb_4bit_use_double_quant=True,               # Nested quantization: extra ~0.4 bits saved
+            load_in_8bit=True,
         ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
