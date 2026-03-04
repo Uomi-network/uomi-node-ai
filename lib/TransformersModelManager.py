@@ -255,14 +255,20 @@ class TransformersModelManager:
                     print(f"[model-load] Accelerate multi-GPU path failed ({accel_err}); falling back to AutoModel loader")
 
             if self.current_gpu_model is None:
-                device_map_env = os.getenv("DEVICE_MAP", "auto")
-                print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
                 # When BitsAndBytes quantization is active, do NOT pass torch_dtype.
-                # BnB handles dtype internally, and passing torch_dtype causes Accelerate to plan
-                # device placement using the full FP16 model size (~72GB for 36B params) instead
-                # of the quantized size (~18GB), which makes Accelerate spill layers to CPU and
-                # then BnB raises "Some modules are dispatched on the CPU or the disk".
+                # BnB handles dtype internally (via bnb_4bit_compute_dtype), and passing
+                # torch_dtype causes Accelerate to plan device placement using the raw model
+                # size instead of the quantized size, causing CPU spill.
                 dtype_kwargs: dict = {} if is_bnb_quantized else {"torch_dtype": load_dtype}
+                # For BnB-quantized models use "balanced_low_0": it spreads layers evenly
+                # across all GPUs while keeping GPU 0 lighter for activations and KV cache.
+                # "auto" packs GPU 0 first and can push the model over the per-GPU limit.
+                if is_bnb_quantized:
+                    default_device_map = "balanced_low_0"
+                else:
+                    default_device_map = "auto"
+                device_map_env = os.getenv("DEVICE_MAP", default_device_map)
+                print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
                 try:
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
@@ -273,8 +279,7 @@ class TransformersModelManager:
                         **self.model_config.model_kwargs
                     )
                 except Exception as e:
-                    print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
-                    # Clean up any partial model state and GPU memory before retry
+                    print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'balanced_low_0'")
                     try:
                         del self.current_gpu_model
                     except AttributeError:
@@ -285,7 +290,7 @@ class TransformersModelManager:
                         torch.cuda.empty_cache()
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
-                        device_map='auto',
+                        device_map='balanced_low_0',
                         cache_dir=MODELS_FOLDER,
                         **dtype_kwargs,
                         **self.model_config.model_kwargs
