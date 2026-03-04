@@ -250,13 +250,19 @@ class TransformersModelManager:
             if self.current_gpu_model is None:
                 device_map_env = os.getenv("DEVICE_MAP", "auto")
                 print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+                # When BitsAndBytes quantization is active, do NOT pass torch_dtype.
+                # BnB handles dtype internally, and passing torch_dtype causes Accelerate to plan
+                # device placement using the full FP16 model size (~72GB for 36B params) instead
+                # of the quantized size (~18GB), which makes Accelerate spill layers to CPU and
+                # then BnB raises "Some modules are dispatched on the CPU or the disk".
+                dtype_kwargs: dict = {} if is_bnb_quantized else {"torch_dtype": load_dtype}
                 try:
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
                         device_map=device_map_env,
                         max_memory=max_memory,
-                        torch_dtype=load_dtype,
                         cache_dir=MODELS_FOLDER,
+                        **dtype_kwargs,
                         **self.model_config.model_kwargs
                     )
                 except Exception as e:
@@ -273,8 +279,8 @@ class TransformersModelManager:
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
                         device_map='auto',
-                        torch_dtype=load_dtype,
                         cache_dir=MODELS_FOLDER,
+                        **dtype_kwargs,
                         **self.model_config.model_kwargs
                     )
         
