@@ -5,10 +5,12 @@ import os
 from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MAX_TOKENS
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
-from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, TransformersModelManager
+from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B_A3B_FP8_MODEL_CONFIG, TransformersModelManager
 
-# Active model config: swap to QWEN35_35B_A3B_MODEL_CONFIG for 2x RTX 4090 (48GB) deployment
-ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_MODEL_CONFIG
+# Active model config:
+#   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, recommended
+#   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB NF4 4-bit (needs bitsandbytes)
+ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_FP8_MODEL_CONFIG
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
@@ -81,7 +83,7 @@ class RunnerExecutor:
                 max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "0") or "0")
                 if max_replicas > 0:
                     target_gpus = target_gpus[:max_replicas]
-                if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG:
+                if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG or ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
                     # Multi-GPU model: single instance distributed across all GPUs via device_map='auto'
                     print(f"🔧 Spawning single multi-GPU instance of {ACTIVE_MODEL_CONFIG.model_name} across {len(target_gpus)} GPU(s)")
                     try:

@@ -259,75 +259,42 @@ class TransformersModelManager:
                 # BnB handles dtype internally (via bnb_4bit_compute_dtype), and passing
                 # torch_dtype causes Accelerate to plan device placement using the raw model
                 # size instead of the quantized size, causing CPU spill.
-                dtype_kwargs: dict = {} if is_bnb_quantized else {"torch_dtype": load_dtype}
+                # Also skip if the config already provides torch_dtype (e.g. "auto" for FP8 models)
+                # to avoid "got multiple values for argument" errors.
+                dtype_kwargs: dict = {}
+                if not is_bnb_quantized and "torch_dtype" not in self.model_config.model_kwargs:
+                    dtype_kwargs["torch_dtype"] = load_dtype
 
                 if is_bnb_quantized:
-                    # BnB 4-bit multi-GPU automatic placement ("auto", "balanced_low_0") is
-                    # unreliable: accelerate reads FREE VRAM, BnB multiplies by 0.9, then
-                    # get_balanced_memory caps per-GPU budgets further. If the model size
-                    # estimate is computed in BF16 (before special_dtypes correction), it
-                    # appears as ~70 GB and spills to CPU regardless of actual free VRAM.
+                    # BnB 4-bit refuses to load if the final device_map contains "cpu" or "disk".
                     #
-                    # FIX: use an EXPLICIT device_map that bypasses all automatic estimation.
-                    # {"": N} = put everything on GPU N. This never triggers BnB's CPU-spill
-                    # validation (which only fires when modules land on "cpu" or "disk").
-                    # 4-bit NF4 + double_quant = ~18-22 GB — fits on a single 4090 (24 GB).
-                    # Only 10 of 40 layers use full attention (rest are GatedDeltaNet recurrent)
-                    # so KV cache is tiny (~160 MB at 8K context), leaving plenty of headroom.
-                    device_map_env = os.getenv("DEVICE_MAP", "")  # empty string = use our logic
-                    if device_map_env:
-                        # User explicitly overrode via env var — respect it
-                        eff_device_map: dict | str = device_map_env
-                    else:
-                        # Pick the GPU with the most free VRAM
-                        best_gpu = 0
-                        best_free = 0
-                        for gid in range(torch.cuda.device_count()):
-                            free, _ = torch.cuda.mem_get_info(gid)
-                            if free > best_free:
-                                best_free = free
-                                best_gpu = gid
-                        eff_device_map = {"": best_gpu}
-                    print(f"[model-load] BnB explicit device_map={eff_device_map}, max_memory={max_memory}")
-                    try:
-                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                            self.model_config.model_name,
-                            device_map=eff_device_map,
-                            cache_dir=MODELS_FOLDER,
-                            **dtype_kwargs,
-                            **self.model_config.model_kwargs
-                        )
-                    except Exception as e:
-                        print(f"[model-load] explicit device_map={eff_device_map} failed ({e}); trying other GPUs")
-                        try:
-                            del self.current_gpu_model
-                        except AttributeError:
-                            pass
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        # Try remaining GPUs
-                        for gid in range(torch.cuda.device_count()):
-                            if eff_device_map == {"": gid}:
-                                continue
-                            try:
-                                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                                    self.model_config.model_name,
-                                    device_map={"": gid},
-                                    cache_dir=MODELS_FOLDER,
-                                    **dtype_kwargs,
-                                    **self.model_config.model_kwargs
-                                )
-                                print(f"[model-load] Loaded on GPU {gid}")
-                                break
-                            except Exception as e2:
-                                print(f"[model-load] GPU {gid} also failed: {e2}")
-                                try:
-                                    del self.current_gpu_model
-                                except AttributeError:
-                                    pass
-                                gc.collect()
-                                torch.cuda.empty_cache()
+                    # Root causes when using max_memory=None or a plain string device_map:
+                    #   1. accelerate's get_max_memory() reads FREE VRAM (not physical total)
+                    #      and always appends a "cpu" key — BnB's validate_environment fires.
+                    #   2. BnB internally runs adjust_max_memory() which does 0.9× on whatever
+                    #      we pass, so our own 90% reduction + BnB's = 81% — too tight for
+                    #      a ~22 GB model across 2× 24 GiB GPUs.
+                    #
+                    # FIX: pass the PHYSICAL TOTAL VRAM (integer bytes, no "cpu" key) for
+                    # every visible GPU.  BnB's adjust_max_memory applies a single 0.9× pass
+                    # (e.g. 24 GiB → 21.6 GiB; 2× = 43.2 GiB total > 22 GB model).
+                    # With device_map="auto", infer_auto_device_map distributes layers on
+                    # GPU 0 and 1 only — BnB validation sees {0, 1}, no "cpu"/"disk" → passes.
+                    bnb_max_memory: dict = {}
+                    for _gid in range(torch.cuda.device_count()):
+                        bnb_max_memory[_gid] = torch.cuda.get_device_properties(_gid).total_memory
+                    _mem_str = ", ".join(f"{k}: {v // 1024**3} GiB" for k, v in bnb_max_memory.items())
+                    print(f"[model-load] BnB multi-GPU load: device_map='auto', max_memory={{ {_mem_str} }}")
+
+                    device_map_env = os.getenv("DEVICE_MAP", "auto")
+                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        device_map=device_map_env,
+                        max_memory=bnb_max_memory,
+                        cache_dir=MODELS_FOLDER,
+                        **dtype_kwargs,
+                        **self.model_config.model_kwargs,
+                    )
                 else:
                     device_map_env = os.getenv("DEVICE_MAP", "auto")
                     print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
@@ -836,6 +803,25 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
     tokenizer_kwargs={},  # Qwen3.5 includes enable_thinking support in its default chat template
+)
+
+# FP8-quantized variant: weights are already baked as float8_e4m3fn on HuggingFace.
+# Total disk/GPU footprint: ~37.5 GB — fits across 2x RTX 4090 (48 GB) with ~10 GB headroom.
+# RTX 4090 (Ada Lovelace, SM 8.9) has native FP8 tensor-core support.
+# No bitsandbytes needed; device_map="auto" with torch_dtype="auto" loads cleanly.
+# Quality is nearly identical to BF16 (Qwen's fine-grained block-128 FP8 scheme).
+QWEN35_35B_A3B_FP8_MODEL_CONFIG = TransformersModelConfig(
+    model_name='Qwen/Qwen3.5-35B-A3B-FP8',
+    deterministic=False,
+    location='gpu',
+    keep_in_memory=True,
+    model_kwargs={
+        # torch_dtype="auto" tells Transformers to preserve the native FP8 weights.
+        # Without this, from_pretrained would upcast to FP16 (~70 GB) → OOM.
+        'torch_dtype': 'auto',
+        'trust_remote_code': True,
+    },
+    tokenizer_kwargs={},
 )
 
 DEEPSEEK_MODEL_CONFIG = TransformersModelConfig(
