@@ -138,6 +138,10 @@ class TransformersModelManager:
             # Ensure transformers streams weights per layer instead of duplicating them in GPU memory
             self.model_config.model_kwargs.setdefault("low_cpu_mem_usage", True)
 
+        # Also enable low_cpu_mem_usage for large FP8/FP16 models to avoid doubling RAM during init
+        if not has_quantization:
+            self.model_config.model_kwargs.setdefault("low_cpu_mem_usage", True)
+
         # Detect bitsandbytes quantization: load_checkpoint_and_dispatch cannot apply bnb quantization
         # (it loads raw FP16 weights). BnB quantization MUST go through AutoModelForCausalLM.from_pretrained.
         is_bnb_quantized = has_quantization and isinstance(
@@ -344,8 +348,17 @@ class TransformersModelManager:
                     # "balanced" distributes layers evenly across GPUs (critical for multi-GPU).
                     # "auto" is greedy and fills GPU 0 first → OOM on 2x4090 with 37.5 GB FP8 model.
                     raw_device_map_env = os.getenv("DEVICE_MAP")
-                    if is_fp8_checkpoint:
-                        device_map_env = raw_device_map_env or "balanced"
+                    if is_fp8_checkpoint and torch.cuda.is_available() and torch.cuda.device_count() > 1 and not raw_device_map_env:
+                        # String device maps ("balanced", "auto") don't split large checkpoint shards
+                        # across GPUs — they assign whole shards to one GPU and cause OOM.
+                        # Build an explicit layer-by-layer round-robin map so each layer is
+                        # individually assigned to alternating GPUs.
+                        rr_map = self._build_round_robin_device_map()
+                        if rr_map:
+                            device_map_env = rr_map
+                            print(f"[model-load] FP8 multi-GPU: using explicit round-robin device_map ({len(rr_map)} layer entries)")
+                        else:
+                            device_map_env = "balanced"
                     else:
                         device_map_env = raw_device_map_env or "balanced"
                     allow_disk_offload = os.getenv("ALLOW_DISK_OFFLOAD", "0") == "1"
