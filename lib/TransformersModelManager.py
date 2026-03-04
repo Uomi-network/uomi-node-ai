@@ -271,12 +271,12 @@ class TransformersModelManager:
 
             # load_checkpoint_and_dispatch loads raw FP16/BF16 weights and cannot apply bitsandbytes
             # quantization. For BnB-quantized models, quantization MUST happen inside from_pretrained.
-            # For FP8 checkpoints we DO want accelerate dispatch: from_pretrained loads full shards
-            # into GPU memory before distributing, causing OOM even with device_map="balanced".
-            # Accelerate streams weight-by-weight so no single GPU ever gets a full 17GB shard.
+            # For FP8 checkpoints: from_config fails for new architectures (qwen3_5_moe) so the
+            # accelerate dispatch path is skipped; from_pretrained with device_map="auto" handles it.
             use_accelerate_multigpu = (
                 not is_bnb_quantized and
-                (is_fp8_checkpoint or has_quantization) and
+                not is_fp8_checkpoint and
+                has_quantization and
                 torch.cuda.is_available() and
                 torch.cuda.device_count() > 1 and
                 os.getenv("DISABLE_ACCELERATE", "0") != "1"
@@ -353,19 +353,17 @@ class TransformersModelManager:
                     # "balanced" distributes layers evenly across GPUs (critical for multi-GPU).
                     # "auto" is greedy and fills GPU 0 first → OOM on 2x4090 with 37.5 GB FP8 model.
                     raw_device_map_env = os.getenv("DEVICE_MAP")
-                    if is_fp8_checkpoint and torch.cuda.is_available() and torch.cuda.device_count() > 1 and not raw_device_map_env:
-                        # String device maps ("balanced", "auto") don't split large checkpoint shards
-                        # across GPUs — they assign whole shards to one GPU and cause OOM.
-                        # Build an explicit layer-by-layer round-robin map so each layer is
-                        # individually assigned to alternating GPUs.
-                        rr_map = self._build_round_robin_device_map()
-                        if rr_map:
-                            device_map_env = rr_map
-                            print(f"[model-load] FP8 multi-GPU: using explicit round-robin device_map ({len(rr_map)} layer entries)")
-                        else:
-                            device_map_env = "balanced"
+                    if raw_device_map_env:
+                        device_map_env = raw_device_map_env
+                    elif is_fp8_checkpoint and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                        # For MoE models like Qwen3.5, "balanced" doesn't understand the architecture
+                        # and puts ALL layers on GPU 0 ignoring max_memory.
+                        # "auto" fills GPU 0 up to the max_memory limit then overflows to GPU 1.
+                        # max_memory is already set above to {0: "20GiB", 1: "20GiB"} which hard-caps
+                        # each GPU so auto can never fill any one card past that limit.
+                        device_map_env = "auto"
                     else:
-                        device_map_env = raw_device_map_env or "balanced"
+                        device_map_env = "balanced"
                     allow_disk_offload = os.getenv("ALLOW_DISK_OFFLOAD", "0") == "1"
                     print(
                         f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}, "
