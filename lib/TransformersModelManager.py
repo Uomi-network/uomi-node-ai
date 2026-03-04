@@ -129,8 +129,8 @@ class TransformersModelManager:
                 print(f"[model-load] Failed to parse MAX_MEMORY='{max_memory_env}': {e}")
                 max_memory = None
 
-        # When force_device is set, place entire model on that GPU explicitly to avoid CPU or other GPU usage
-        # Strategy: set allocator for fragmentation resilience, set current device, and load with device_map
+        # When force_device is set, place entire model on that GPU explicitly to avoid CPU or other GPU usage.
+        # For BnB models, we must use from_pretrained (not load_checkpoint_and_dispatch) so quantization applies.
         if self.force_device is not None and torch.cuda.is_available():
             print(f"[model-load] Forcing single-device placement on {self.force_device}")
             # Improve fragmentation resilience if not already set
@@ -148,29 +148,45 @@ class TransformersModelManager:
                 print(f"[model-load] Warning: failed to set CUDA device context: {e}")
             # Empty cache to reduce fragmentation before loading
             torch.cuda.empty_cache()
-            # Try zero-CPU load first via Accelerate; if not available, fail hard (no CPU fallback)
-            try:
-                from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
-                from huggingface_hub import snapshot_download  # type: ignore
-                # Download snapshot locally for accelerate (requires a local checkpoint path)
-                local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
-                # Zero-CPU load: initialize empty model on meta and dispatch weights directly to GPU
-                cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
-                with init_empty_weights():
-                    empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
-                with torch.cuda.device(gid):
-                    self.current_gpu_model = load_checkpoint_and_dispatch(
-                        empty_model,
-                        checkpoint=local_dir,
-                        device_map={"": self.force_device},
-                        max_memory={gid: "18GiB"},  # Limit to 18GiB per GPU to leave more headroom
-                        dtype=load_dtype,
-                        no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
-                    )
-                print("[model-load] Loaded via Accelerate with zero-CPU dispatch")
-            except Exception as e:
-                print(f"[model-load] Accelerate path failed ({e}); no CPU fallback allowed - failing startup")
-                raise RuntimeError(f"Failed to load model on GPU {self.force_device} without CPU usage: {e}")
+            if is_bnb_quantized:
+                # BnB quantization path: keep everything on the forced GPU.
+                print(f"[model-load] BnB single-device load on cuda:{gid}")
+                load_kwargs = dict(
+                    device_map={"": gid},
+                    cache_dir=MODELS_FOLDER,
+                    **self.model_config.model_kwargs,
+                )
+                if isinstance(max_memory, dict) and gid in max_memory:
+                    load_kwargs["max_memory"] = {gid: max_memory[gid]}
+                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_config.model_name,
+                    **load_kwargs,
+                )
+                print("[model-load] Loaded BnB model with forced single-device placement")
+            else:
+                # Try zero-CPU load first via Accelerate; if not available, fail hard (no CPU fallback)
+                try:
+                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
+                    from huggingface_hub import snapshot_download  # type: ignore
+                    # Download snapshot locally for accelerate (requires a local checkpoint path)
+                    local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
+                    # Zero-CPU load: initialize empty model on meta and dispatch weights directly to GPU
+                    cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
+                    with init_empty_weights():
+                        empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
+                    with torch.cuda.device(gid):
+                        self.current_gpu_model = load_checkpoint_and_dispatch(
+                            empty_model,
+                            checkpoint=local_dir,
+                            device_map={"": self.force_device},
+                            max_memory={gid: "18GiB"},  # Limit to 18GiB per GPU to leave more headroom
+                            dtype=load_dtype,
+                            no_split_module_classes=self.model_config.model_kwargs.get("no_split_module_classes")
+                        )
+                    print("[model-load] Loaded via Accelerate with zero-CPU dispatch")
+                except Exception as e:
+                    print(f"[model-load] Accelerate path failed ({e}); no CPU fallback allowed - failing startup")
+                    raise RuntimeError(f"Failed to load model on GPU {self.force_device} without CPU usage: {e}")
         else:
             # Auto-set max_memory for multi-GPU to ensure proper distribution without CPU offload
             if max_memory is None and torch.cuda.is_available():
@@ -397,6 +413,14 @@ class TransformersModelManager:
                 raise RuntimeError(f"Model effective device is '{effective_device}' but GPU '{self.force_device}' was requested; refusing CPU fallback")
             if str(effective_device) != str(self.force_device):
                 print(f"⚠️  [model-load] Effective device '{effective_device}' does not match requested '{self.force_device}'")
+            if hasattr(self.current_gpu_model, 'hf_device_map') and isinstance(self.current_gpu_model.hf_device_map, dict):
+                bad = [k for k, v in self.current_gpu_model.hf_device_map.items() if not (
+                    (isinstance(v, str) and v.startswith('cuda')) or isinstance(v, int)
+                )]
+                if bad:
+                    raise RuntimeError(
+                        f"Forced-device load mapped some modules off GPU ({len(bad)} modules): {bad[:5]}"
+                    )
         
         if self.device == 'cpu':
             print("CUDA not available, model loaded on CPU")

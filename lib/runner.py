@@ -11,14 +11,16 @@ from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B
 #   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, recommended
 #   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB NF4 4-bit (needs bitsandbytes)
 def _select_active_model_config():
-    variant = os.getenv("QWEN_MODEL_VARIANT", "fp8").strip().lower()
+    # Deterministic default: BnB 4-bit is currently the most stable path on 2x4090
+    # with this custom HF loader stack.
+    variant = os.getenv("QWEN_MODEL_VARIANT", "bnb").strip().lower()
     if variant in {"4bit", "bnb", "nf4", "qwen3.5-35b-a3b"}:
         return QWEN35_35B_A3B_MODEL_CONFIG
     return QWEN35_35B_A3B_FP8_MODEL_CONFIG
 
 
 ACTIVE_MODEL_CONFIG = _select_active_model_config()
-print(f"[runner] ACTIVE_MODEL_CONFIG={ACTIVE_MODEL_CONFIG.model_name} (QWEN_MODEL_VARIANT={os.getenv('QWEN_MODEL_VARIANT', 'fp8')})")
+print(f"[runner] ACTIVE_MODEL_CONFIG={ACTIVE_MODEL_CONFIG.model_name} (QWEN_MODEL_VARIANT={os.getenv('QWEN_MODEL_VARIANT', 'bnb')})")
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
@@ -92,12 +94,11 @@ class RunnerExecutor:
                 max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "0") or "0")
                 if max_replicas > 0:
                     target_gpus = target_gpus[:max_replicas]
-                if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG or ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
-                    # Multi-GPU model: single instance distributed across all GPUs.
-                    # If FP8 fails to load in this environment, optionally fall back to BnB 4-bit.
+                if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
+                    # FP8 path: single model instance distributed across GPUs.
                     candidate_configs = [ACTIVE_MODEL_CONFIG]
-                    allow_fallback = os.getenv("QWEN_FALLBACK_ON_LOAD_FAILURE", "1") == "1"
-                    if allow_fallback and ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
+                    allow_fallback = os.getenv("QWEN_FALLBACK_ON_LOAD_FAILURE", "0") == "1"
+                    if allow_fallback:
                         candidate_configs.append(QWEN35_35B_A3B_MODEL_CONFIG)
 
                     last_error = None
@@ -123,6 +124,19 @@ class RunnerExecutor:
                                 pass
                     if not self.transformers_model_managers and last_error is not None:
                         print(f"❌ All multi-GPU model load attempts failed. Last error: {last_error}")
+                elif ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG:
+                    # BnB 4-bit path: one full replica per GPU for real parallel throughput.
+                    self.active_model_name = ACTIVE_MODEL_CONFIG.model_name
+                    for gid in target_gpus:
+                        dev = f"cuda:{gid}"
+                        print(f"🔧 Spawning BnB model replica on {dev}")
+                        try:
+                            tm = TransformersModelManager(ACTIVE_MODEL_CONFIG, force_device=dev)
+                            tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                            self.transformers_model_managers.append(tm)
+                        except Exception as e:
+                            print(f"❌ Failed to spawn BnB replica on {dev}: {e}")
+                            continue
                 else:
                     # Single-GPU model: one replica per GPU
                     for gid in target_gpus:
