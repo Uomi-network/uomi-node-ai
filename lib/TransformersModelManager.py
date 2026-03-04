@@ -271,13 +271,15 @@ class TransformersModelManager:
 
             # load_checkpoint_and_dispatch loads raw FP16/BF16 weights and cannot apply bitsandbytes
             # quantization. For BnB-quantized models, quantization MUST happen inside from_pretrained.
-            # Using this path for a 35B model would require ~70GB (2x physical VRAM) and cause OOM.
+            # For FP8 checkpoints we DO want accelerate dispatch: from_pretrained loads full shards
+            # into GPU memory before distributing, causing OOM even with device_map="balanced".
+            # Accelerate streams weight-by-weight so no single GPU ever gets a full 17GB shard.
             use_accelerate_multigpu = (
-                has_quantization and
                 not is_bnb_quantized and
+                (is_fp8_checkpoint or has_quantization) and
                 torch.cuda.is_available() and
                 torch.cuda.device_count() > 1 and
-                os.getenv("DEVICE_MAP", "auto") == "auto"
+                os.getenv("DISABLE_ACCELERATE", "0") != "1"
             )
 
             if use_accelerate_multigpu:
@@ -315,7 +317,10 @@ class TransformersModelManager:
                     dispatch_kwargs = {
                         "device_map": device_map_value,
                         "max_memory": max_memory,
-                        "dtype": load_dtype,
+                        # For FP8 checkpoints: do NOT pass dtype — let accelerate read the native
+                        # float8_e4m3fn dtype from the checkpoint. Passing float16 would upcast
+                        # the weights to ~75GB and cause OOM.
+                        "dtype": None if is_fp8_checkpoint else load_dtype,
                         "no_split_module_classes": self.model_config.model_kwargs.get("no_split_module_classes"),
                     }
                     self.current_gpu_model = load_checkpoint_and_dispatch(
