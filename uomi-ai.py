@@ -15,14 +15,19 @@ from lib.system import System
 from lib.zipper import unzip_string
 from lib.monitoring import MonitoringService
 
-# When vLLM spawns tensor-parallel workers it re-executes this file via
-# multiprocessing spawn. parent_process() is None only in the true main process.
-# Workers must not run any initialisation — just importing the module is enough
-# for Python's spawn machinery to restore the execution context.
-if _mp.parent_process() is not None:
-    # We are a vLLM worker subprocess: do nothing and let spawn continue.
-    pass
-else:
+# When vLLM spawns tensor-parallel workers it invokes Python as:
+#   python -c "from multiprocessing.spawn import spawn_main; spawn_main(...)"
+# so sys.argv[0] == '-c'. Normal execution has sys.argv[0] ending in .py.
+# We must not run any initialisation in worker processes.
+_is_spawn_worker = sys.argv[0] == '-c'
+
+# app must be defined at module level because @app.route decorators run at import time.
+app = Flask(__name__)
+app_cache: dict = {}
+service_start_time = datetime.datetime.now()
+request_history: list = []
+
+if not _is_spawn_worker:
     # ── Main process only ──────────────────────────────────────────────────
 
     print(' ')
@@ -45,10 +50,6 @@ else:
     print('🚀 Runner setup completed!')
     print('\n')
 
-    app = Flask(__name__)
-    app_cache: dict = {}
-    service_start_time = datetime.datetime.now()
-    request_history: list = []
     monitoring_service = MonitoringService(app)
 
     def cleanup_services():
@@ -301,7 +302,7 @@ def monitoring_json():
         "gc_collected": collected
     })
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not _is_spawn_worker:
     print("🚀 Starting Flask app...")
     monitoring_service.start()
 
