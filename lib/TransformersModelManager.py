@@ -288,55 +288,31 @@ class TransformersModelManager:
                     from huggingface_hub import snapshot_download  # type: ignore
 
                     local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
-                    cfg = AutoConfig.from_pretrained(
-                        local_dir,
-                        cache_dir=MODELS_FOLDER,
-                        trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
-                    )
-                    # Some newer MoE configs (e.g. Qwen3.5) omit vocab_size; infer from tokenizer to satisfy HF loader
-                    if not getattr(cfg, 'vocab_size', None):
-                        inferred_vocab = len(self.tokenizer)
-                        setattr(cfg, 'vocab_size', inferred_vocab)
-                        print(f"[model-load] Inferred missing vocab_size={inferred_vocab} for {cfg.__class__.__name__}")
-                    # Qwen3_5MoeConfig uses num_attention_heads*head_dim instead of hidden_size.
-                    # AutoModelForCausalLM.from_config needs hidden_size to build the skeleton model.
-                    if not hasattr(cfg, 'hidden_size') or not cfg.hidden_size:
-                        nh = getattr(cfg, 'num_attention_heads', 0)
-                        hd = getattr(cfg, 'head_dim', 0)
-                        if nh and hd:
-                            cfg.hidden_size = nh * hd
-                            print(f"[model-load] Inferred missing hidden_size={cfg.hidden_size} ({nh} heads * {hd} head_dim)")
-                    with init_empty_weights():
-                        # For FP8 checkpoints we don't pass dtype to from_config — the skeleton
-                        # is dtype-agnostic; the actual FP8 weights are loaded by dispatch later.
-                        if is_fp8_checkpoint:
-                            empty_model = AutoModelForCausalLM.from_config(cfg)
-                        else:
-                            empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
 
-                    device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
-                    if isinstance(device_map_value, str) and device_map_value == "balanced_low_0":
-                        # Qwen3.5 MoE keeps repeating GPU0 allocations when using the built-in balanced maps.
-                        # Define a deterministic round-robin map over transformer blocks so expert shards
-                        # are evenly split without ever requesting >1GiB contiguous chunks on a single GPU.
-                        block_map: Dict[str, str] = {}
-                        current_gpu = 0
-                        total_layers = getattr(cfg, 'num_hidden_layers', 0)
-                        for layer_idx in range(total_layers):
-                            key = f"model.layers.{layer_idx}"
-                            block_map[key] = f"cuda:{current_gpu}"
-                            current_gpu = (current_gpu + 1) % torch.cuda.device_count()
-                        # Ensure the embedding and lm_head live on GPU0 to avoid host/device transfers
-                        block_map["model.embed_tokens"] = "cuda:0"
-                        block_map["model.norm"] = "cuda:0"
-                        block_map["lm_head"] = "cuda:0"
-                        device_map_value = block_map
+                    # Use from_pretrained inside init_empty_weights — this creates the full model
+                    # skeleton (all params on meta/empty device) without loading any weights.
+                    # Avoids from_config which fails for new MoE architectures that don't expose
+                    # hidden_size directly (e.g. Qwen3_5MoeConfig).
+                    with init_empty_weights():
+                        empty_model = AutoModelForCausalLM.from_pretrained(
+                            local_dir,
+                            trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+                        )
+
+                    # Build round-robin device map: layer 0→GPU 0, layer 1→GPU 1, layer 2→GPU 0…
+                    # This guarantees no GPU receives more than half the layers.
+                    device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "auto")
+                    if device_map_value == "auto":
+                        rr_map = self._build_round_robin_device_map()
+                        if rr_map:
+                            device_map_value = rr_map
+                            print(f"[model-load] Accelerate round-robin map: {len(rr_map)} layer entries across {torch.cuda.device_count()} GPUs")
+
                     dispatch_kwargs = {
                         "device_map": device_map_value,
                         "max_memory": max_memory,
-                        # For FP8 checkpoints: do NOT pass dtype — let accelerate read the native
-                        # float8_e4m3fn dtype from the checkpoint. Passing float16 would upcast
-                        # the weights to ~75GB and cause OOM.
+                        # For FP8: omit dtype so accelerate preserves native float8_e4m3fn weights.
+                        # Passing float16 would upcast to ~75 GB and OOM immediately.
                         "dtype": None if is_fp8_checkpoint else load_dtype,
                         "no_split_module_classes": self.model_config.model_kwargs.get("no_split_module_classes"),
                     }
