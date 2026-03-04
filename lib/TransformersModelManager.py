@@ -18,6 +18,40 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any, List
 from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Monkey-patch bitsandbytes Int8Params / Params4bit so they accept the
+# `_is_hf_initialized` kwarg that bleeding-edge transformers passes.
+# Without this, from_pretrained crashes with:
+#   Int8Params.__new__() got an unexpected keyword argument '_is_hf_initialized'
+# This is safe: we just pop the extra kwarg before calling the original __new__.
+# ---------------------------------------------------------------------------
+try:
+    import bitsandbytes as bnb
+    import inspect
+
+    for _cls_name in ('Int8Params', 'Params4bit'):
+        _cls = getattr(bnb.nn, _cls_name, None)
+        if _cls is None:
+            continue
+        _orig_new = _cls.__new__
+        # Only patch if the original doesn't already accept _is_hf_initialized
+        _sig = inspect.signature(_orig_new)
+        if '_is_hf_initialized' not in _sig.parameters and '**' not in str(_sig):
+            def _make_patched(orig, cls_ref):
+                def _patched_new(cls, *args, **kwargs):
+                    kwargs.pop('_is_hf_initialized', None)
+                    return orig(cls, *args, **kwargs)
+                return _patched_new
+            _cls.__new__ = _make_patched(_orig_new, _cls)
+            print(f"[bnb-compat] Patched {_cls_name}.__new__ to accept _is_hf_initialized")
+    del _cls_name, _cls, _orig_new, _sig
+except ImportError:
+    pass  # bitsandbytes not installed; quantization paths will fail later with a clear error
+except Exception as _patch_err:
+    print(f"[bnb-compat] Warning: failed to patch bitsandbytes: {_patch_err}")
+# ---------------------------------------------------------------------------
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
@@ -386,17 +420,32 @@ class TransformersModelManager:
         # Report resolved device map for observability
         if hasattr(self.current_gpu_model, 'hf_device_map'):
             print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
-            # Fail fast by default if any module got offloaded to disk/CPU.
+            # Check for offloaded modules.
+            # For BnB int8 with llm_int8_enable_fp32_cpu_offload, CPU modules are expected and safe.
             if os.getenv("ALLOW_DISK_OFFLOAD", "0") != "1":
                 dm = self.current_gpu_model.hf_device_map
                 disk_modules = [k for k, v in dm.items() if str(v) == 'disk']
                 cpu_modules = [k for k, v in dm.items() if str(v) == 'cpu']
-                if disk_modules or cpu_modules:
+                # Allow CPU offload when int8 fp32_cpu_offload is enabled
+                bnb_cfg = self.model_config.model_kwargs.get('quantization_config')
+                allows_cpu = (
+                    isinstance(bnb_cfg, BitsAndBytesConfig)
+                    and getattr(bnb_cfg, 'load_in_8bit', False)
+                    and getattr(bnb_cfg, 'llm_int8_enable_fp32_cpu_offload', False)
+                )
+                if disk_modules:
                     raise RuntimeError(
-                        f"Model has offloaded modules (disk={len(disk_modules)}, cpu={len(cpu_modules)}). "
+                        f"Model has {len(disk_modules)} module(s) offloaded to disk. "
+                        f"Set ALLOW_DISK_OFFLOAD=1 to permit it, or raise MAX_MEMORY."
+                    )
+                if cpu_modules and not allows_cpu:
+                    raise RuntimeError(
+                        f"Model has {len(cpu_modules)} module(s) on CPU. "
                         f"Refusing slow offload path. "
                         f"Set ALLOW_DISK_OFFLOAD=1 to permit it, or raise MAX_MEMORY / adjust DEVICE_MAP."
                     )
+                if cpu_modules and allows_cpu:
+                    print(f"[model-load] {len(cpu_modules)} non-quantized module(s) on CPU (expected for int8 fp32_cpu_offload): {cpu_modules[:5]}")
         
         # Report actual model device placement (may show 'cpu' for dispatched models)
         try:
@@ -458,29 +507,35 @@ class TransformersModelManager:
             print(f"[model-load] Could not build round-robin device_map: {e}")
             return None
 
-    def _build_bnb_retry_max_memory(self) -> Dict[int, str] | None:
-        """Build realistic max_memory for BnB retries based on physical VRAM."""
+    def _build_bnb_retry_max_memory(self) -> Dict[int | str, str] | None:
+        """Build realistic max_memory for BnB loads based on physical VRAM.
+        Includes a CPU budget so accelerate can place non-quantizable modules (embeds, norms) there
+        when llm_int8_enable_fp32_cpu_offload=True."""
         if not torch.cuda.is_available():
             return None
         try:
             headroom_gib = float(os.getenv("BNB_RETRY_HEADROOM_GIB", "1.5"))
         except Exception:
             headroom_gib = 1.5
-        budgets: Dict[int, str] = {}
+        budgets: Dict[int | str, str] = {}
         for gid in range(torch.cuda.device_count()):
             total_gib = torch.cuda.get_device_properties(gid).total_memory / (1024 ** 3)
             budget = max(1, int(total_gib - headroom_gib))
             budgets[gid] = f"{budget}GiB"
+        # CPU budget for non-quantizable modules (embeddings, layer norms, lm_head)
+        budgets["cpu"] = os.getenv("BNB_CPU_BUDGET", "8GiB")
         return budgets
 
     def _load_bnb_model_with_retries(self, dtype_kwargs: Dict[str, Any]):
         """Load BnB quantized model with retry strategies when auto map spills to CPU."""
         device_map_env = os.getenv("DEVICE_MAP", "auto")
-        print(f"[model-load] BnB multi-GPU load attempt: device_map='{device_map_env}'")
+        max_memory = self._build_bnb_retry_max_memory()
+        print(f"[model-load] BnB multi-GPU load attempt: device_map='{device_map_env}', max_memory={max_memory}")
         try:
             return AutoModelForCausalLM.from_pretrained(
                 self.model_config.model_name,
                 device_map=device_map_env,
+                max_memory=max_memory,
                 cache_dir=MODELS_FOLDER,
                 **dtype_kwargs,
                 **self.model_config.model_kwargs,
