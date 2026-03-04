@@ -171,13 +171,32 @@ class TransformersModelManager:
                         print(f"[model-load] Auto-detected {num_gpus} GPUs (BnB-quantized: skipping manual max_memory, letting BnB manage budget)")
                         max_memory = None
                     else:
+                        # Check whether this model uses a compressed on-disk dtype (e.g. FP8 via
+                        # torch_dtype="auto"). Accelerate always estimates model size in BF16
+                        # (2 bytes/param), so a 35B-param FP8 model looks like ~72 GB to Accelerate
+                        # even though it's only ~37.5 GB on disk. With a real 44 GiB GPU budget
+                        # (2x 22 GiB), Accelerate assigns ~28 GB to disk → MoE safetensors crash.
+                        #
+                        # Fix: inflate the per-GPU budget to 2x physical so the BF16 overestimate
+                        # fits entirely in "GPU" memory. The actual loaded model fits easily in
+                        # the real 48 GiB (2x RTX 4090). No disk offload occurs.
+                        uses_compressed_dtype = (
+                            self.model_config.model_kwargs.get("torch_dtype") == "auto"
+                        )
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            # Non-quantized: leave ~1GiB headroom
-                            safe_gib = total_gb - 1
-                            max_memory[i] = f"{safe_gib}GiB"
-                        print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
+                            if uses_compressed_dtype:
+                                # Inflate to 2× physical: forces Accelerate's BF16 estimate (~72 GB)
+                                # to fit across GPUs without any disk offload.
+                                budget_gib = total_gb * 2
+                                max_memory[i] = f"{budget_gib}GiB"
+                            else:
+                                # Standard non-quantized model: subtract 1 GiB headroom.
+                                max_memory[i] = f"{total_gb - 1}GiB"
+                        print(f"[model-load] Auto-detected {num_gpus} GPUs "
+                              f"({'inflated for FP8/compressed dtype' if uses_compressed_dtype else 'standard'}), "
+                              f"setting max_memory={max_memory}")
 
             # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
