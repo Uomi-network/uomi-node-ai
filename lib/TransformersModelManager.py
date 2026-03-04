@@ -50,6 +50,23 @@ except ImportError:
     pass  # bitsandbytes not installed; quantization paths will fail later with a clear error
 except Exception as _patch_err:
     print(f"[bnb-compat] Warning: failed to patch bitsandbytes: {_patch_err}")
+
+# Also patch torch.nn.Parameter.__new__ — transformers dev passes _is_hf_initialized
+# to ALL parameter constructors including the base torch one (hit inside init_empty_weights).
+try:
+    import torch.nn as _torch_nn
+    _orig_param_new = _torch_nn.Parameter.__new__
+    import inspect as _inspect
+    _param_sig = _inspect.signature(_orig_param_new)
+    if '_is_hf_initialized' not in _param_sig.parameters and '**' not in str(_param_sig):
+        def _patched_param_new(cls, *args, **kwargs):
+            kwargs.pop('_is_hf_initialized', None)
+            return _orig_param_new(cls, *args, **kwargs)
+        _torch_nn.Parameter.__new__ = _patched_param_new
+        print("[bnb-compat] Patched torch.nn.Parameter.__new__ to accept _is_hf_initialized")
+    del _orig_param_new, _param_sig
+except Exception as _pp_err:
+    print(f"[bnb-compat] Warning: failed to patch torch.nn.Parameter: {_pp_err}")
 # ---------------------------------------------------------------------------
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
@@ -284,26 +301,22 @@ class TransformersModelManager:
 
             if use_accelerate_multigpu:
                 try:
-                    from accelerate import dispatch_model  # type: ignore
+                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
+                    from huggingface_hub import snapshot_download  # type: ignore
 
-                    # Step 1: load entire model to CPU (server has 60 GiB RAM, model is ~37.5 GiB).
-                    # This avoids all GPU shard-loading issues — no CUDA memory touched during load.
-                    print(f"[model-load] Loading FP8 model to CPU first, then dispatching to GPUs")
-                    cpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
-                        torch_dtype="auto",
-                        device_map="cpu",
-                        trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
-                        low_cpu_mem_usage=True,
-                        cache_dir=MODELS_FOLDER,
-                    )
+                    local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
 
-                    # Step 2: build round-robin map from the actual loaded model parameters.
-                    # We now know num_hidden_layers from the real model, not the config.
-                    try:
-                        n_layers = cpu_model.config.num_hidden_layers
-                    except Exception:
-                        n_layers = sum(1 for n, _ in cpu_model.named_modules() if n.startswith("model.layers.") and n.count(".") == 2)
+                    # from_pretrained inside init_empty_weights creates the model skeleton on
+                    # meta device (zero memory). torch.nn.Parameter.__new__ is patched above
+                    # to accept _is_hf_initialized so this no longer crashes.
+                    with init_empty_weights():
+                        empty_model = AutoModelForCausalLM.from_pretrained(
+                            local_dir,
+                            trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+                        )
+
+                    # Build round-robin map from the actual model config (now loaded correctly).
+                    n_layers = empty_model.config.num_hidden_layers
                     n_gpus = torch.cuda.device_count()
                     round_robin: Dict[str, str] = {
                         f"model.layers.{i}": f"cuda:{i % n_gpus}" for i in range(n_layers)
@@ -311,11 +324,19 @@ class TransformersModelManager:
                     round_robin["model.embed_tokens"] = "cuda:0"
                     round_robin["model.norm"] = "cuda:0"
                     round_robin["lm_head"] = "cuda:0"
-                    print(f"[model-load] Dispatching {n_layers} layers across {n_gpus} GPUs")
+                    print(f"[model-load] Accelerate: {n_layers} layers across {n_gpus} GPUs via load_checkpoint_and_dispatch")
 
-                    # Step 3: dispatch_model moves each tensor to its assigned GPU one by one.
-                    self.current_gpu_model = dispatch_model(cpu_model, device_map=round_robin)
-                    print(f"[model-load] Loaded via CPU-first + dispatch_model")
+                    # load_checkpoint_and_dispatch reads one tensor at a time from the safetensor
+                    # files and sends each directly to its assigned GPU — the 17 GiB shard is
+                    # never allocated as a single contiguous block on any GPU.
+                    self.current_gpu_model = load_checkpoint_and_dispatch(
+                        empty_model,
+                        checkpoint=local_dir,
+                        device_map=round_robin,
+                        max_memory=max_memory,
+                        **({} if is_fp8_checkpoint else {"dtype": load_dtype}),
+                    )
+                    print(f"[model-load] Loaded via Accelerate load_checkpoint_and_dispatch")
                 except Exception as accel_err:
                     self.current_gpu_model = None
                     import gc
