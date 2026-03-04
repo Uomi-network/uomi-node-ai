@@ -14,40 +14,17 @@ from lib.system import System
 from lib.zipper import unzip_string
 from lib.monitoring import MonitoringService
 
-print(' ')
-print('|' * 50)
-print("🧠 Uomi Node AI")
-print('|' * 50)
-print(' ')
-
-system = System()
-sys.exit(0) if not system.check_system_requirements() else 1
-sys.exit(0) if not system.check_cuda_availability() else 1
-system.setup_environment_variables()
-print('🚀 System setup completed!')
-print('\n')
-
-runner_queue = RunnerQueue()
-runner_executor = RunnerExecutor(runner_queue)
-print('🚀 Runner setup completed!')
-print('\n')
-
+# These are set in __main__ init; worker sub-processes imported via spawn will see None
+# and must not attempt to reinitialise.
+runner_queue: "RunnerQueue | None" = None
+runner_executor: "RunnerExecutor | None" = None
 app = Flask(__name__)
-app_cache = {}
-
-# Global variables for monitoring
+app_cache: dict = {}
 service_start_time = datetime.datetime.now()
-request_history = []
-cuda_available = system.check_cuda_availability()
-
-# Initialize monitoring service
-monitoring_service = MonitoringService(app)
-
-# Setup cleanup on exit
-def cleanup_services():
-    monitoring_service.stop()
-
-atexit.register(cleanup_services)
+request_history: list = []
+system: "System | None" = None
+cuda_available: bool = False
+monitoring_service: "MonitoringService | None" = None
 
 @app.route('/status', methods=['GET'])
 def status_json():
@@ -294,11 +271,37 @@ def monitoring_json():
     })
 
 if __name__ == "__main__":
+    print(' ')
+    print('|' * 50)
+    print("🧠 Uomi Node AI")
+    print('|' * 50)
+    print(' ')
+
+    system = System()
+    sys.exit(0) if not system.check_system_requirements() else 1
+    sys.exit(0) if not system.check_cuda_availability() else 1
+    system.setup_environment_variables()
+    print('🚀 System setup completed!')
+    print('\n')
+
+    cuda_available = system.check_cuda_availability()
+
+    runner_queue = RunnerQueue()
+    runner_executor = RunnerExecutor(runner_queue)
+    print('🚀 Runner setup completed!')
+    print('\n')
+
+    monitoring_service = MonitoringService(app)
+
+    def cleanup_services():
+        if monitoring_service:
+            monitoring_service.stop()
+
+    atexit.register(cleanup_services)
+
     print("🚀 Starting Flask app...")
-    
-    # Start monitoring service
     monitoring_service.start()
-    
+
     try:
         app.run(host='0.0.0.0', port=8888, debug=False)
     except KeyboardInterrupt:

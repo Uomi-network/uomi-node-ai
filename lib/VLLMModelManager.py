@@ -32,8 +32,8 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     model_name="Qwen/Qwen3.5-35B-A3B-FP8",
     tensor_parallel_size=2,
     dtype="auto",
-    max_model_len=8192,
-    gpu_memory_utilization=0.88,
+    max_model_len=4096,
+    gpu_memory_utilization=0.96,
 )
 
 
