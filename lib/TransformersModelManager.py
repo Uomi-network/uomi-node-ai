@@ -459,24 +459,22 @@ class TransformersModelManager:
             return None
 
     def _build_bnb_retry_max_memory(self) -> Dict[int, str] | None:
-        """Inflate max_memory for BnB retries to counter internal 0.9 safety shrink."""
+        """Build realistic max_memory for BnB retries based on physical VRAM."""
         if not torch.cuda.is_available():
             return None
         try:
-            headroom_gib = float(os.getenv("BNB_RETRY_HEADROOM_GIB", "1.0"))
+            headroom_gib = float(os.getenv("BNB_RETRY_HEADROOM_GIB", "1.5"))
         except Exception:
-            headroom_gib = 1.0
+            headroom_gib = 1.5
         budgets: Dict[int, str] = {}
         for gid in range(torch.cuda.device_count()):
             total_gib = torch.cuda.get_device_properties(gid).total_memory / (1024 ** 3)
-            post_adjust_target = max(1.0, total_gib - headroom_gib)
-            # transformers BnB quantizer multiplies max_memory by 0.9 internally.
-            pre_adjust_budget = max(1, int(post_adjust_target / 0.90))
-            budgets[gid] = f"{pre_adjust_budget}GiB"
+            budget = max(1, int(total_gib - headroom_gib))
+            budgets[gid] = f"{budget}GiB"
         return budgets
 
     def _load_bnb_model_with_retries(self, dtype_kwargs: Dict[str, Any]):
-        """Load 4-bit BnB model with GPU-only retry strategies when auto map spills to CPU."""
+        """Load BnB quantized model with retry strategies when auto map spills to CPU."""
         device_map_env = os.getenv("DEVICE_MAP", "auto")
         print(f"[model-load] BnB multi-GPU load attempt: device_map='{device_map_env}'")
         try:
@@ -967,6 +965,7 @@ QWEN35_35B_A3B_MODEL_CONFIG = TransformersModelConfig(
         # Released: February 24, 2026
         'quantization_config': BitsAndBytesConfig(
             load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,  # Allow small non-quantized layers (embeds, norms) on CPU
         ),
         'trust_remote_code': True,  # Load model code from HuggingFace repo (needed for new archs)
     },
