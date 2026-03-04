@@ -10,7 +10,7 @@ from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B
 # Active model config:
 #   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, recommended
 #   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB NF4 4-bit (needs bitsandbytes)
-ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_FP8_MODEL_CONFIG
+ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_MODEL_CONFIG
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
