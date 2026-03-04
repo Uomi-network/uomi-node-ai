@@ -299,10 +299,12 @@ class TransformersModelManager:
                         setattr(cfg, 'vocab_size', inferred_vocab)
                         print(f"[model-load] Inferred missing vocab_size={inferred_vocab} for {cfg.__class__.__name__}")
                     with init_empty_weights():
-                        # For FP8 checkpoints pass torch_dtype="auto" so the skeleton model
-                        # is created with the native FP8 dtype rather than float16.
-                        init_dtype = "auto" if is_fp8_checkpoint else load_dtype
-                        empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=init_dtype)
+                        # For FP8 checkpoints we don't pass dtype to from_config — the skeleton
+                        # is dtype-agnostic; the actual FP8 weights are loaded by dispatch later.
+                        if is_fp8_checkpoint:
+                            empty_model = AutoModelForCausalLM.from_config(cfg)
+                        else:
+                            empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=load_dtype)
 
                     device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
                     if isinstance(device_map_value, str) and device_map_value == "balanced_low_0":
