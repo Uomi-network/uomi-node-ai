@@ -186,11 +186,11 @@ class TransformersModelManager:
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            # Leave 4 GiB headroom for CUDA context + temporary loading buffers.
-                            # This forces Accelerate to split the model across both GPUs.
-                            # RTX 4090: total_gb=23 → 19 GiB per GPU → 38 GiB total.
-                            # FP8 model (~35 GiB) fits, GPU 0 peaks at ~20 GiB (safe under 23.55 GiB).
-                            max_memory[i] = f"{max(1, total_gb - 4)}GiB"
+                            # Leave 3 GiB headroom for CUDA context + temporary loading buffers.
+                            # RTX 4090: total_gb=23 → 20 GiB per GPU → 40 GiB total.
+                            # FP8 model (~35 GiB) fits across both GPUs with no disk offload,
+                            # and GPU 0 peaks at ~21 GiB during loading (safe under 23.55 GiB).
+                            max_memory[i] = f"{max(1, total_gb - 3)}GiB"
                         print(f"[model-load] Auto-detected {num_gpus} GPUs, "
                               f"setting max_memory={max_memory}")
 
