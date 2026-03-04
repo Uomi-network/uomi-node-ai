@@ -260,41 +260,103 @@ class TransformersModelManager:
                 # torch_dtype causes Accelerate to plan device placement using the raw model
                 # size instead of the quantized size, causing CPU spill.
                 dtype_kwargs: dict = {} if is_bnb_quantized else {"torch_dtype": load_dtype}
-                # For BnB-quantized models use "balanced_low_0": it spreads layers evenly
-                # across all GPUs while keeping GPU 0 lighter for activations and KV cache.
-                # "auto" packs GPU 0 first and can push the model over the per-GPU limit.
+
                 if is_bnb_quantized:
-                    default_device_map = "balanced_low_0"
-                else:
-                    default_device_map = "auto"
-                device_map_env = os.getenv("DEVICE_MAP", default_device_map)
-                print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-                try:
-                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
-                        device_map=device_map_env,
-                        max_memory=max_memory,
-                        cache_dir=MODELS_FOLDER,
-                        **dtype_kwargs,
-                        **self.model_config.model_kwargs
-                    )
-                except Exception as e:
-                    print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'balanced_low_0'")
+                    # BnB 4-bit multi-GPU automatic placement ("auto", "balanced_low_0") is
+                    # unreliable: accelerate reads FREE VRAM, BnB multiplies by 0.9, then
+                    # get_balanced_memory caps per-GPU budgets further. If the model size
+                    # estimate is computed in BF16 (before special_dtypes correction), it
+                    # appears as ~70 GB and spills to CPU regardless of actual free VRAM.
+                    #
+                    # FIX: use an EXPLICIT device_map that bypasses all automatic estimation.
+                    # {"": N} = put everything on GPU N. This never triggers BnB's CPU-spill
+                    # validation (which only fires when modules land on "cpu" or "disk").
+                    # 4-bit NF4 + double_quant = ~18-22 GB — fits on a single 4090 (24 GB).
+                    # Only 10 of 40 layers use full attention (rest are GatedDeltaNet recurrent)
+                    # so KV cache is tiny (~160 MB at 8K context), leaving plenty of headroom.
+                    device_map_env = os.getenv("DEVICE_MAP", "")  # empty string = use our logic
+                    if device_map_env:
+                        # User explicitly overrode via env var — respect it
+                        eff_device_map: dict | str = device_map_env
+                    else:
+                        # Pick the GPU with the most free VRAM
+                        best_gpu = 0
+                        best_free = 0
+                        for gid in range(torch.cuda.device_count()):
+                            free, _ = torch.cuda.mem_get_info(gid)
+                            if free > best_free:
+                                best_free = free
+                                best_gpu = gid
+                        eff_device_map = {"": best_gpu}
+                    print(f"[model-load] BnB explicit device_map={eff_device_map}, max_memory={max_memory}")
                     try:
-                        del self.current_gpu_model
-                    except AttributeError:
-                        pass
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
+                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                            self.model_config.model_name,
+                            device_map=eff_device_map,
+                            cache_dir=MODELS_FOLDER,
+                            **dtype_kwargs,
+                            **self.model_config.model_kwargs
+                        )
+                    except Exception as e:
+                        print(f"[model-load] explicit device_map={eff_device_map} failed ({e}); trying other GPUs")
+                        try:
+                            del self.current_gpu_model
+                        except AttributeError:
+                            pass
+                        import gc
+                        gc.collect()
                         torch.cuda.empty_cache()
-                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
-                        device_map='balanced_low_0',
-                        cache_dir=MODELS_FOLDER,
-                        **dtype_kwargs,
-                        **self.model_config.model_kwargs
-                    )
+                        # Try remaining GPUs
+                        for gid in range(torch.cuda.device_count()):
+                            if eff_device_map == {"": gid}:
+                                continue
+                            try:
+                                self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                                    self.model_config.model_name,
+                                    device_map={"": gid},
+                                    cache_dir=MODELS_FOLDER,
+                                    **dtype_kwargs,
+                                    **self.model_config.model_kwargs
+                                )
+                                print(f"[model-load] Loaded on GPU {gid}")
+                                break
+                            except Exception as e2:
+                                print(f"[model-load] GPU {gid} also failed: {e2}")
+                                try:
+                                    del self.current_gpu_model
+                                except AttributeError:
+                                    pass
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                else:
+                    device_map_env = os.getenv("DEVICE_MAP", "auto")
+                    print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+                    try:
+                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                            self.model_config.model_name,
+                            device_map=device_map_env,
+                            max_memory=max_memory,
+                            cache_dir=MODELS_FOLDER,
+                            **dtype_kwargs,
+                            **self.model_config.model_kwargs
+                        )
+                    except Exception as e:
+                        print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+                        try:
+                            del self.current_gpu_model
+                        except AttributeError:
+                            pass
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                            self.model_config.model_name,
+                            device_map='auto',
+                            cache_dir=MODELS_FOLDER,
+                            **dtype_kwargs,
+                            **self.model_config.model_kwargs
+                        )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
         # and no forced device pinning was requested
