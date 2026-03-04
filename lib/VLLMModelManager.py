@@ -49,6 +49,17 @@ class VLLMModelManager:
     def __init__(self, model_config: VLLMModelConfig):
         from vllm import LLM  # type: ignore
 
+        # Qwen3_5MoeForCausalLM may exist in the codebase but not yet be registered
+        # in the vLLM model registry (nightly builds lag behind main). Register it now.
+        try:
+            from vllm.model_executor.models import ModelRegistry  # type: ignore
+            if "Qwen3_5MoeForCausalLM" not in ModelRegistry.models:
+                from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM  # type: ignore
+                ModelRegistry.register_model("Qwen3_5MoeForCausalLM", Qwen3_5MoeForCausalLM)
+                print("[vllm] Registered Qwen3_5MoeForCausalLM in ModelRegistry")
+        except Exception as reg_err:
+            print(f"[vllm] Warning: could not register Qwen3_5MoeForCausalLM: {reg_err}")
+
         self.model_config = model_config
         self.model_name = model_config.model_name
         self.device = "cuda"
