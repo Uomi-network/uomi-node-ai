@@ -46,8 +46,8 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     model_name="Qwen/Qwen3.5-35B-A3B-FP8",
     tensor_parallel_size=2,
     dtype="auto",
-    max_model_len=4096,
-    gpu_memory_utilization=0.96,
+    max_model_len=2048,
+    gpu_memory_utilization=0.90,
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
     hf_overrides={"architectures": ["Qwen3_5MoeForCausalLM"]},
@@ -103,6 +103,7 @@ class VLLMModelManager:
             "--gpu-memory-utilization", str(cfg.gpu_memory_utilization),
             "--port", str(cfg.port),
             "--trust-remote-code",
+            "--enforce-eager",
         ]
         if cfg.hf_overrides:
             cmd += ["--hf-overrides", json.dumps(cfg.hf_overrides)]
@@ -121,22 +122,14 @@ class VLLMModelManager:
 
     def _start_server(self):
         cmd = self._build_cmd()
-        print(f"[vllm-serve] Starting: {' '.join(cmd)}")
+        print(f"[vllm-serve] Starting: {' '.join(cmd)}", flush=True)
+        # Don't capture stdout/stderr — let vllm write directly to the journal
+        # so HuggingFace download progress bars are visible in `journalctl -f`.
         self._proc = subprocess.Popen(
             cmd,
             env=os.environ.copy(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
         )
-        # Stream server output to our stdout
-        def _log():
-            for raw in self._proc.stdout:
-                try:
-                    print(f"[vllm-server] {raw.decode('utf-8', errors='replace').rstrip()}", flush=True)
-                except Exception:
-                    pass
-        threading.Thread(target=_log, daemon=True).start()
         self._wait_for_ready(timeout=600)
 
     def _wait_for_ready(self, timeout: int = 600):
