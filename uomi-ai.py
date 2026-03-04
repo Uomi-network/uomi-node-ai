@@ -15,11 +15,14 @@ from lib.system import System
 from lib.zipper import unzip_string
 from lib.monitoring import MonitoringService
 
-# When vLLM spawns tensor-parallel workers it invokes Python as:
-#   python -c "from multiprocessing.spawn import spawn_main; spawn_main(...)"
-# so sys.argv[0] == '-c'. Normal execution has sys.argv[0] ending in .py.
+# When vLLM spawns tensor-parallel workers via multiprocessing spawn, Python's
+# _fixup_main_from_path re-executes this script via:
+#   runpy.run_path(main_path, run_name="__mp_main__")
+# so __name__ == '__mp_main__' in workers, NOT '__main__'.
+# (sys.argv[0] == '-c' is wrong: argv[0] gets reset to the script path
+#  before runpy.run_path is called, so it's unreliable.)
 # We must not run any initialisation in worker processes.
-_is_spawn_worker = sys.argv[0] == '-c'
+_is_spawn_worker = __name__ == '__mp_main__'
 
 # app must be defined at module level because @app.route decorators run at import time.
 app = Flask(__name__)
