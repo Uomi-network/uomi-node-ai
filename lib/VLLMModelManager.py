@@ -105,7 +105,7 @@ class VLLMModelManager:
             "--trust-remote-code",
             "--enforce-eager",
             "--enable-auto-tool-choice",
-            "--tool-call-parser", "qwen3_coder",
+            "--tool-call-parser", os.environ.get("VLLM_TOOL_CALL_PARSER", "hermes"),
         ]
         if cfg.hf_overrides:
             cmd += ["--hf-overrides", json.dumps(cfg.hf_overrides)]
@@ -254,7 +254,22 @@ class VLLMModelManager:
 
             # Qwen3.5 thinking mode is controlled via chat_template_kwargs in extra_body.
             # The /think and /no_think soft-switches are NOT supported on Qwen3.5.
-            patched_messages = list(messages)
+            #
+            # vLLM strictly requires tool_calls in assistant messages to have an `id` field.
+            # Inject a stable id if missing so callers don't need to track it.
+            patched_messages = []
+            for m in messages:
+                m = dict(m)
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    fixed_calls = []
+                    for i, tc in enumerate(m["tool_calls"]):
+                        tc = dict(tc)
+                        if "id" not in tc:
+                            fn_name = tc.get("function", {}).get("name", "fn")
+                            tc["id"] = f"call_{fn_name}_{i}"
+                        fixed_calls.append(tc)
+                    m["tool_calls"] = fixed_calls
+                patched_messages.append(m)
 
             payload: Dict[str, Any] = {
                 "model": self.model_name,
@@ -277,8 +292,17 @@ class VLLMModelManager:
                 method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                raw = resp.read()
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    raw = resp.read()
+            except urllib.error.HTTPError as http_err:
+                err_body = ""
+                try:
+                    err_body = http_err.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                print(f"[vllm-serve] HTTP {http_err.code} from vLLM: {err_body}")
+                raise
 
             data = json.loads(raw)
             message = data["choices"][0]["message"]
