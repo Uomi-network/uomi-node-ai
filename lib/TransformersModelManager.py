@@ -273,31 +273,14 @@ class TransformersModelManager:
                     dtype_kwargs["torch_dtype"] = load_dtype
 
                 if is_bnb_quantized:
-                    # BnB 4-bit refuses to load if the final device_map contains "cpu" or "disk".
-                    #
-                    # Root causes when using max_memory=None or a plain string device_map:
-                    #   1. accelerate's get_max_memory() reads FREE VRAM (not physical total)
-                    #      and always appends a "cpu" key — BnB's validate_environment fires.
-                    #   2. BnB internally runs adjust_max_memory() which does 0.9× on whatever
-                    #      we pass, so our own 90% reduction + BnB's = 81% — too tight for
-                    #      a ~22 GB model across 2× 24 GiB GPUs.
-                    #
-                    # FIX: pass the PHYSICAL TOTAL VRAM (integer bytes, no "cpu" key) for
-                    # every visible GPU.  BnB's adjust_max_memory applies a single 0.9× pass
-                    # (e.g. 24 GiB → 21.6 GiB; 2× = 43.2 GiB total > 22 GB model).
-                    # With device_map="auto", infer_auto_device_map distributes layers on
-                    # GPU 0 and 1 only — BnB validation sees {0, 1}, no "cpu"/"disk" → passes.
-                    bnb_max_memory: dict = {}
-                    for _gid in range(torch.cuda.device_count()):
-                        bnb_max_memory[_gid] = torch.cuda.get_device_properties(_gid).total_memory
-                    _mem_str = ", ".join(f"{k}: {v // 1024**3} GiB" for k, v in bnb_max_memory.items())
-                    print(f"[model-load] BnB multi-GPU load: device_map='auto', max_memory={{ {_mem_str} }}")
-
+                    # Official HuggingFace approach: device_map="auto" without max_memory.
+                    # Newer versions of accelerate (0.27+) correctly plan device placement
+                    # using 4-bit sizes instead of BF16 sizes, so no inflation is needed.
                     device_map_env = os.getenv("DEVICE_MAP", "auto")
+                    print(f"[model-load] BnB multi-GPU load: device_map='{device_map_env}' (no max_memory override)")
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
                         device_map=device_map_env,
-                        max_memory=bnb_max_memory,
                         cache_dir=MODELS_FOLDER,
                         **dtype_kwargs,
                         **self.model_config.model_kwargs,
