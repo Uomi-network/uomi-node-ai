@@ -210,6 +210,7 @@ class RunnerExecutor:
                         import json
                         payload = json.loads(input_json)
                         messages = payload["messages"]
+                        tools = payload.get("tools") or None
                         enable_thinking = payload.get("enable_thinking", req["request"].get("enable_thinking", True))
                         # Allow optional per-request sampling / max tokens overrides
                         sampling_cfg = payload.get("sampling", {"temperature":0.7, "top_k":5})
@@ -296,7 +297,7 @@ class RunnerExecutor:
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         # Pick the least loaded replica and submit
                         target_tm = self._pick_transformers_manager()
-                        target_tm.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids)
+                        target_tm.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids, tools=tools)
                     # elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                     #     def on_finished(_idx, output, rq=req):
                     #         with self.lock:

@@ -104,6 +104,8 @@ class VLLMModelManager:
             "--port", str(cfg.port),
             "--trust-remote-code",
             "--enforce-eager",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "qwen3_coder",
         ]
         if cfg.hf_overrides:
             cmd += ["--hf-overrides", json.dumps(cfg.hf_overrides)]
@@ -200,6 +202,7 @@ class VLLMModelManager:
         on_complete: Callable,
         is_check: bool = False,
         forced_tokens: Optional[List[int]] = None,
+        tools: Optional[List[Dict]] = None,
     ) -> str:
         sid = uuid.uuid4().hex
         with self._lock:
@@ -207,7 +210,7 @@ class VLLMModelManager:
         self._executor.submit(
             self._run,
             sid, messages, enable_thinking, sampling_cfg,
-            max_new_tokens, on_token, on_complete, is_check, forced_tokens,
+            max_new_tokens, on_token, on_complete, is_check, forced_tokens, tools,
         )
         return sid
 
@@ -238,6 +241,7 @@ class VLLMModelManager:
         on_complete: Callable,
         is_check: bool,
         forced_tokens: Optional[List[int]],
+        tools: Optional[List[Dict]] = None,
     ):
         import urllib.request, urllib.error
 
@@ -261,6 +265,9 @@ class VLLMModelManager:
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": enable_thinking},
             }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
 
             body = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
@@ -274,7 +281,14 @@ class VLLMModelManager:
                 raw = resp.read()
 
             data = json.loads(raw)
-            generated_text: str = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            generated_text: str = message.get("content") or ""
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                # Serialize tool_calls to JSON — encoded into token IDs for the proof,
+                # consistently between generate and check runs.
+                tool_calls_str = json.dumps(tool_calls, ensure_ascii=False)
+                generated_text = (generated_text + "\n" + tool_calls_str).strip() if generated_text else tool_calls_str
 
             # Encode the FULL response text in one shot — never chunk-by-chunk.
             # This guarantees identical token IDs between generate and check runs.
