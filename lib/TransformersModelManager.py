@@ -271,12 +271,12 @@ class TransformersModelManager:
 
             # load_checkpoint_and_dispatch loads raw FP16/BF16 weights and cannot apply bitsandbytes
             # quantization. For BnB-quantized models, quantization MUST happen inside from_pretrained.
-            # For FP8 checkpoints: from_config fails for new architectures (qwen3_5_moe) so the
-            # accelerate dispatch path is skipped; from_pretrained with device_map="auto" handles it.
+            # For FP8 checkpoints: from_pretrained loads the full checkpoint shard (~17 GiB) into
+            # the current GPU before distributing — OOM even with max_memory set.
+            # load_checkpoint_and_dispatch streams individual tensors so no full shard ever lands
+            # on one GPU. Now that transformers dev supports qwen3_5_moe, from_config works.
             use_accelerate_multigpu = (
                 not is_bnb_quantized and
-                not is_fp8_checkpoint and
-                has_quantization and
                 torch.cuda.is_available() and
                 torch.cuda.device_count() > 1 and
                 os.getenv("DISABLE_ACCELERATE", "0") != "1"
@@ -288,14 +288,21 @@ class TransformersModelManager:
                     from huggingface_hub import snapshot_download  # type: ignore
 
                     local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
-                    cfg = AutoConfig.from_pretrained(local_dir, cache_dir=MODELS_FOLDER)
+                    cfg = AutoConfig.from_pretrained(
+                        local_dir,
+                        cache_dir=MODELS_FOLDER,
+                        trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+                    )
                     # Some newer MoE configs (e.g. Qwen3.5) omit vocab_size; infer from tokenizer to satisfy HF loader
                     if not getattr(cfg, 'vocab_size', None):
                         inferred_vocab = len(self.tokenizer)
                         setattr(cfg, 'vocab_size', inferred_vocab)
                         print(f"[model-load] Inferred missing vocab_size={inferred_vocab} for {cfg.__class__.__name__}")
                     with init_empty_weights():
-                        empty_model = AutoModelForCausalLM.from_config(cfg, dtype=load_dtype)
+                        # For FP8 checkpoints pass torch_dtype="auto" so the skeleton model
+                        # is created with the native FP8 dtype rather than float16.
+                        init_dtype = "auto" if is_fp8_checkpoint else load_dtype
+                        empty_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=init_dtype)
 
                     device_map_value: Dict[str, str] | str = os.getenv("ACCELERATE_DEVICE_MAP", "balanced_low_0")
                     if isinstance(device_map_value, str) and device_map_value == "balanced_low_0":
