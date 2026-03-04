@@ -158,19 +158,26 @@ class TransformersModelManager:
             if max_memory is None and torch.cuda.is_available():
                 num_gpus = torch.cuda.device_count()
                 if num_gpus > 1:
-                    max_memory = {}
-                    for i in range(num_gpus):
-                        total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                        if is_bnb_quantized:
-                            # BnB quantization is applied during from_pretrained; Accelerate accounts
-                            # for it when planning. Use 90% of physical VRAM to leave headroom for
-                            # KV cache and activations. Do NOT inflate beyond physical VRAM.
-                            safe_gib = math.floor(total_gb * 0.9)
-                        else:
+                    if is_bnb_quantized:
+                        # For BnB 4-bit quantized models, do NOT set max_memory here.
+                        # BnB's quantizer already calls adjust_max_memory() which multiplies
+                        # every budget value by 0.90 internally. If we pre-apply our own
+                        # 90% reduction AND BnB applies another 90%, the effective budget
+                        # becomes 81% of VRAM per GPU — too low for the model to fit
+                        # (e.g. 2x RTX 4090: 24GB × 0.81 × 2 = ~39GB for a ~22GB model,
+                        # but individual GPU budgets of ~19GB can be blown by a single GPU's
+                        # share). Let Accelerate read actual free VRAM and let BnB's own
+                        # adjust_max_memory() apply the single safety margin it needs.
+                        print(f"[model-load] Auto-detected {num_gpus} GPUs (BnB-quantized: skipping manual max_memory, letting BnB manage budget)")
+                        max_memory = None
+                    else:
+                        max_memory = {}
+                        for i in range(num_gpus):
+                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
                             # Non-quantized: leave ~1GiB headroom
                             safe_gib = total_gb - 1
-                        max_memory[i] = f"{safe_gib}GiB"
-                    print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
+                            max_memory[i] = f"{safe_gib}GiB"
+                        print(f"[model-load] Auto-detected {num_gpus} GPUs, setting max_memory={max_memory}")
 
             # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
