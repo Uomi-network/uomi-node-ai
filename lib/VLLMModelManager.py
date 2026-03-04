@@ -68,6 +68,9 @@ class VLLMModelManager:
             gpu_memory_utilization=model_config.gpu_memory_utilization,
             trust_remote_code=True,
             enforce_eager=False,
+            # The HF config.json says Qwen3_5MoeForConditionalGeneration but vLLM
+            # registers the class as Qwen3_5MoeForCausalLM — override to match.
+            hf_overrides={"architectures": ["Qwen3_5MoeForCausalLM"]},
             **model_config.extra_kwargs,
         )
         self._tokenizer = self.llm.get_tokenizer()
