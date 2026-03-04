@@ -1,4 +1,3 @@
-import math
 import os
 import time
 
@@ -184,38 +183,15 @@ class TransformersModelManager:
                         print(f"[model-load] Auto-detected {num_gpus} GPUs (BnB-quantized: skipping manual max_memory, letting BnB manage budget)")
                         max_memory = None
                     else:
-                        # Check whether this model uses a compressed on-disk dtype (e.g. FP8 via
-                        # torch_dtype="auto"). Accelerate always estimates model size in BF16
-                        # (2 bytes/param), so a 35B-param FP8 model looks like ~72 GB to Accelerate
-                        # even though it's only ~37.5 GB on disk. With a real 44 GiB GPU budget
-                        # (2x 22 GiB), Accelerate assigns ~28 GB to disk → MoE safetensors crash.
-                        #
-                        # Fix: inflate the per-GPU budget to 2x physical so the BF16 overestimate
-                        # fits entirely in "GPU" memory. The actual loaded model fits easily in
-                        # the real 48 GiB (2x RTX 4090). No disk offload occurs.
-                        uses_compressed_dtype = (
-                            self.model_config.model_kwargs.get("torch_dtype") == "auto"
-                        )
                         max_memory = {}
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            if uses_compressed_dtype:
-                                # Accelerate plans device placement using the BF16 size of each layer
-                                # (2 bytes/param), not the FP8 size (1 byte/param). For a 35B-param
-                                # FP8 model, Accelerate sees ~70 GiB, but the actual loaded size is
-                                # ~37.5 GB. We inflate the per-GPU budget so the BF16 estimate fits
-                                # entirely on GPU with no disk offload.
-                                #
-                                # 1.6× keeps actual FP8 usage at ~18.5 GiB on GPU 0 (vs 23+ GiB with
-                                # 2×), leaving ~5 GiB headroom for CUDA context + MoE merge buffers.
-                                # 2× was too aggressive: GPU 0 filled to 23.15 GiB → OOM at last alloc.
-                                budget_gib = math.ceil(total_gb * 1.6)
-                                max_memory[i] = f"{budget_gib}GiB"
-                            else:
-                                # Standard non-quantized model: subtract 1 GiB headroom.
-                                max_memory[i] = f"{total_gb - 1}GiB"
-                        print(f"[model-load] Auto-detected {num_gpus} GPUs "
-                              f"({'inflated 1.6x for FP8/compressed dtype' if uses_compressed_dtype else 'standard'}), "
+                            # Leave 4 GiB headroom for CUDA context + temporary loading buffers.
+                            # This forces Accelerate to split the model across both GPUs.
+                            # RTX 4090: total_gb=23 → 19 GiB per GPU → 38 GiB total.
+                            # FP8 model (~35 GiB) fits, GPU 0 peaks at ~20 GiB (safe under 23.55 GiB).
+                            max_memory[i] = f"{max(1, total_gb - 4)}GiB"
+                        print(f"[model-load] Auto-detected {num_gpus} GPUs, "
                               f"setting max_memory={max_memory}")
 
             # PYTORCH_CUDA_ALLOC_CONF (expandable_segments, max_split_size_mb) is set
