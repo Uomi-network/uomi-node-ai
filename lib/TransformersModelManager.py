@@ -284,47 +284,38 @@ class TransformersModelManager:
 
             if use_accelerate_multigpu:
                 try:
-                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # type: ignore
-                    from huggingface_hub import snapshot_download  # type: ignore
+                    from accelerate import dispatch_model  # type: ignore
 
-                    local_dir = snapshot_download(self.model_config.model_name, cache_dir=MODELS_FOLDER)
-                    cfg = AutoConfig.from_pretrained(
-                        local_dir,
-                        cache_dir=MODELS_FOLDER,
+                    # Step 1: load entire model to CPU (server has 60 GiB RAM, model is ~37.5 GiB).
+                    # This avoids all GPU shard-loading issues — no CUDA memory touched during load.
+                    print(f"[model-load] Loading FP8 model to CPU first, then dispatching to GPUs")
+                    cpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        torch_dtype="auto",
+                        device_map="cpu",
                         trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+                        low_cpu_mem_usage=True,
+                        cache_dir=MODELS_FOLDER,
                     )
 
-                    # Build round-robin dict BEFORE from_config so we never ask accelerate to
-                    # auto-compute a device map (which reads hidden_size and fails for Qwen3_5MoeConfig).
-                    total_layers = int(getattr(cfg, 'num_hidden_layers', 0))
-                    if total_layers <= 0:
-                        raise RuntimeError(f"Cannot build device map: num_hidden_layers={total_layers}")
+                    # Step 2: build round-robin map from the actual loaded model parameters.
+                    # We now know num_hidden_layers from the real model, not the config.
+                    try:
+                        n_layers = cpu_model.config.num_hidden_layers
+                    except Exception:
+                        n_layers = sum(1 for n, _ in cpu_model.named_modules() if n.startswith("model.layers.") and n.count(".") == 2)
                     n_gpus = torch.cuda.device_count()
                     round_robin: Dict[str, str] = {
-                        f"model.layers.{i}": f"cuda:{i % n_gpus}" for i in range(total_layers)
+                        f"model.layers.{i}": f"cuda:{i % n_gpus}" for i in range(n_layers)
                     }
                     round_robin["model.embed_tokens"] = "cuda:0"
                     round_robin["model.norm"] = "cuda:0"
                     round_robin["lm_head"] = "cuda:0"
-                    print(f"[model-load] Accelerate round-robin map: {total_layers} layers across {n_gpus} GPUs")
+                    print(f"[model-load] Dispatching {n_layers} layers across {n_gpus} GPUs")
 
-                    with init_empty_weights():
-                        # from_config runs model __init__ on meta device — no weights loaded,
-                        # no _is_hf_initialized issues (that's a from_pretrained-only path).
-                        empty_model = AutoModelForCausalLM.from_config(
-                            cfg,
-                            trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
-                        )
-
-                    self.current_gpu_model = load_checkpoint_and_dispatch(
-                        empty_model,
-                        checkpoint=local_dir,
-                        device_map=round_robin,
-                        max_memory=max_memory,
-                        # FP8: omit dtype so weights stay float8_e4m3fn; float16 would upcast to ~75 GB.
-                        **({} if is_fp8_checkpoint else {"dtype": load_dtype}),
-                    )
-                    print(f"[model-load] Loaded via Accelerate load_checkpoint_and_dispatch")
+                    # Step 3: dispatch_model moves each tensor to its assigned GPU one by one.
+                    self.current_gpu_model = dispatch_model(cpu_model, device_map=round_robin)
+                    print(f"[model-load] Loaded via CPU-first + dispatch_model")
                 except Exception as accel_err:
                     self.current_gpu_model = None
                     import gc
