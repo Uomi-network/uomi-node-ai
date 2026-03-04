@@ -46,7 +46,7 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     model_name="Qwen/Qwen3.5-35B-A3B-FP8",
     tensor_parallel_size=2,
     dtype="auto",
-    max_model_len=2048,
+    max_model_len=8192,
     gpu_memory_utilization=0.90,
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
@@ -245,6 +245,8 @@ class VLLMModelManager:
             temperature = float(sampling_cfg.get("temperature", 0.7))
             top_k = int(sampling_cfg.get("top_k", 5))
             n_tokens = len(forced_tokens) if (is_check and forced_tokens) else max_new_tokens
+            # Clamp to max_model_len to avoid vLLM bad_request errors
+            n_tokens = min(n_tokens, self.model_config.max_model_len)
 
             # Qwen3.5 thinking mode is controlled via chat_template_kwargs in extra_body.
             # The /think and /no_think soft-switches are NOT supported on Qwen3.5.
