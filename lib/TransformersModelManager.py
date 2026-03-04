@@ -109,6 +109,12 @@ class TransformersModelManager:
         is_bnb_quantized = has_quantization and isinstance(
             self.model_config.model_kwargs.get('quantization_config'), BitsAndBytesConfig
         )
+        # Heuristic for native FP8 checkpoints (e.g. Qwen ...-FP8)
+        is_fp8_checkpoint = (
+            (not is_bnb_quantized) and
+            ("fp8" in str(self.model_name).lower()) and
+            (str(self.model_config.model_kwargs.get("torch_dtype", "")).lower() == "auto")
+        )
 
         # Parse MAX_MEMORY env: e.g. "0:20GiB,1:20GiB"
         max_memory_env = os.getenv("MAX_MEMORY")
@@ -184,15 +190,24 @@ class TransformersModelManager:
                         max_memory = None
                     else:
                         max_memory = {}
+                        if is_fp8_checkpoint:
+                            # FP8 checkpoints are already compressed; using a 3GiB headroom on 24GiB cards
+                            # can force unnecessary disk offload. Keep only a small safety margin by default.
+                            try:
+                                headroom_gib = float(os.getenv("FP8_GPU_HEADROOM_GIB", "1.0"))
+                            except Exception:
+                                headroom_gib = 1.0
+                        else:
+                            try:
+                                headroom_gib = float(os.getenv("GPU_HEADROOM_GIB", "3.0"))
+                            except Exception:
+                                headroom_gib = 3.0
                         for i in range(num_gpus):
-                            total_gb = torch.cuda.get_device_properties(i).total_memory // (1024 ** 3)
-                            # Leave 3 GiB headroom for CUDA context + temporary loading buffers.
-                            # RTX 4090: total_gb=23 → 20 GiB per GPU → 40 GiB total.
-                            # FP8 model (~35 GiB) fits across both GPUs with no disk offload,
-                            # and GPU 0 peaks at ~21 GiB during loading (safe under 23.55 GiB).
-                            max_memory[i] = f"{max(1, total_gb - 3)}GiB"
+                            total_gb = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+                            per_gpu_budget = max(1, int(total_gb - headroom_gib))
+                            max_memory[i] = f"{per_gpu_budget}GiB"
                         print(f"[model-load] Auto-detected {num_gpus} GPUs, "
-                              f"setting max_memory={max_memory}")
+                              f"setting max_memory={max_memory} (headroom_gib={headroom_gib}, fp8={is_fp8_checkpoint})")
 
             # PYTORCH_CUDA_ALLOC_CONF (expandable_segments, max_split_size_mb) is set
             # at module import time above — nothing to do here.
@@ -273,18 +288,29 @@ class TransformersModelManager:
                 if is_bnb_quantized:
                     self.current_gpu_model = self._load_bnb_model_with_retries(dtype_kwargs)
                 else:
-                    device_map_env = os.getenv("DEVICE_MAP", "balanced")
-                    offload_folder = os.getenv("OFFLOAD_FOLDER", "/tmp/uomi_model_offload")
-                    os.makedirs(offload_folder, exist_ok=True)
-                    print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}, offload_folder='{offload_folder}'")
-                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
+                    # FP8 defaults should avoid disk offload on 2x4090; use "auto" unless explicitly overridden.
+                    default_device_map = "auto" if is_fp8_checkpoint else "balanced"
+                    device_map_env = os.getenv("DEVICE_MAP", default_device_map)
+                    allow_disk_offload = os.getenv("ALLOW_DISK_OFFLOAD", "0") == "1"
+                    print(
+                        f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}, "
+                        f"allow_disk_offload={allow_disk_offload}"
+                    )
+                    load_kwargs = dict(
                         device_map=device_map_env,
                         max_memory=max_memory,
-                        offload_folder=offload_folder,
                         cache_dir=MODELS_FOLDER,
                         **dtype_kwargs,
                         **self.model_config.model_kwargs,
+                    )
+                    if allow_disk_offload:
+                        offload_folder = os.getenv("OFFLOAD_FOLDER", "/tmp/uomi_model_offload")
+                        os.makedirs(offload_folder, exist_ok=True)
+                        load_kwargs["offload_folder"] = offload_folder
+                        print(f"[model-load] offload_folder='{offload_folder}'")
+                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        **load_kwargs,
                     )
                     print(f"[model-load] Loaded with AutoModelForCausalLM")
         
@@ -314,6 +340,17 @@ class TransformersModelManager:
         # Report resolved device map for observability
         if hasattr(self.current_gpu_model, 'hf_device_map'):
             print(f"[model-load] hf_device_map={self.current_gpu_model.hf_device_map}")
+            # Fail fast by default if any module got offloaded to disk/CPU.
+            if os.getenv("ALLOW_DISK_OFFLOAD", "0") != "1":
+                dm = self.current_gpu_model.hf_device_map
+                disk_modules = [k for k, v in dm.items() if str(v) == 'disk']
+                cpu_modules = [k for k, v in dm.items() if str(v) == 'cpu']
+                if disk_modules or cpu_modules:
+                    raise RuntimeError(
+                        f"Model has offloaded modules (disk={len(disk_modules)}, cpu={len(cpu_modules)}). "
+                        f"Refusing slow offload path. "
+                        f"Set ALLOW_DISK_OFFLOAD=1 to permit it, or raise MAX_MEMORY / adjust DEVICE_MAP."
+                    )
         
         # Report actual model device placement (may show 'cpu' for dispatched models)
         try:
