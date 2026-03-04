@@ -298,6 +298,14 @@ class TransformersModelManager:
                         inferred_vocab = len(self.tokenizer)
                         setattr(cfg, 'vocab_size', inferred_vocab)
                         print(f"[model-load] Inferred missing vocab_size={inferred_vocab} for {cfg.__class__.__name__}")
+                    # Qwen3_5MoeConfig uses num_attention_heads*head_dim instead of hidden_size.
+                    # AutoModelForCausalLM.from_config needs hidden_size to build the skeleton model.
+                    if not hasattr(cfg, 'hidden_size') or not cfg.hidden_size:
+                        nh = getattr(cfg, 'num_attention_heads', 0)
+                        hd = getattr(cfg, 'head_dim', 0)
+                        if nh and hd:
+                            cfg.hidden_size = nh * hd
+                            print(f"[model-load] Inferred missing hidden_size={cfg.hidden_size} ({nh} heads * {hd} head_dim)")
                     with init_empty_weights():
                         # For FP8 checkpoints we don't pass dtype to from_config — the skeleton
                         # is dtype-agnostic; the actual FP8 weights are loaded by dispatch later.
