@@ -457,11 +457,20 @@ class TransformersModelManager:
         try:
             if hasattr(self.current_gpu_model, 'hf_device_map') and isinstance(self.current_gpu_model.hf_device_map, dict):
                 dm = self.current_gpu_model.hf_device_map
-                # Prefer any CUDA placement in the map
-                cuda_devices = []
+                # Prefer any CUDA placement in the map. Accelerate may encode devices as:
+                # - "cuda:0"/"cuda"
+                # - integer GPU ids (0, 1, ...)
+                cuda_devices: List[str] = []
                 for v in dm.values():
-                    if isinstance(v, str) and v.startswith('cuda'):
-                        cuda_devices.append(v)
+                    if isinstance(v, int):
+                        cuda_devices.append(f"cuda:{v}")
+                        continue
+                    if isinstance(v, str):
+                        if v.startswith('cuda'):
+                            cuda_devices.append(v if ':' in v else 'cuda:0')
+                            continue
+                        if v.isdigit():
+                            cuda_devices.append(f"cuda:{v}")
                 if cuda_devices:
                     # Pick the lowest-index CUDA device
                     try:
@@ -469,10 +478,12 @@ class TransformersModelManager:
                     except Exception:
                         pass
                     return cuda_devices[0]
-                # Fallback: if only CPU is found, acknowledge it
+                # Never return "disk" as an execution device for input tensors.
+                if str(self.device).startswith('cuda'):
+                    return str(self.device)
                 for v in dm.values():
-                    if isinstance(v, str):
-                        return v
+                    if isinstance(v, str) and v == 'cpu':
+                        return 'cpu'
         except Exception:
             pass
         return str(self.device)

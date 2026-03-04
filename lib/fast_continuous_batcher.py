@@ -106,7 +106,7 @@ class FastContinuousBatcher:
                 print(f"[fast_batcher] Error processing batch: {e}")
                 # Mark all requests as failed
                 for req in batch_requests:
-                    req.on_complete(req.id, "", {"error": str(e), "tokens": []})
+                    req.on_complete(req.id, "", {"error": str(e), "tokens": [], "verified": False})
     
     def _collect_batch(self) -> List[BatchRequest]:
         """Collect requests for batching within the time window"""

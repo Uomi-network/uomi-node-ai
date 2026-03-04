@@ -173,7 +173,7 @@ class RunnerExecutor:
                         import json
                         payload = json.loads(input_json)
                         messages = payload["messages"]
-                        enable_thinking = payload.get("enable_thinking", True)
+                        enable_thinking = payload.get("enable_thinking", req["request"].get("enable_thinking", True))
                         # Allow optional per-request sampling / max tokens overrides
                         sampling_cfg = payload.get("sampling", {"temperature":0.7, "top_k":5})
                         # Determine max_new_tokens with safe cap (env var MAX_NEW_TOKENS, default 128)
@@ -228,11 +228,15 @@ class RunnerExecutor:
                             import json as _j
                             wrapped_proof = ""
                             result_flag = True
+                            result_error = None
                             try:
                                 if proof is not None:
                                     # Ensure proof contains verification flag when available
                                     if isinstance(proof, dict) and 'verified' in proof:
                                         result_flag = bool(proof.get('verified'))
+                                    if isinstance(proof, dict) and proof.get('error'):
+                                        result_flag = False
+                                        result_error = str(proof.get('error'))
                                     wrapped_proof = zip_string(_j.dumps(proof))
                                 else:
                                     wrapped_proof = ""
@@ -247,7 +251,7 @@ class RunnerExecutor:
                                 if result_flag:
                                     rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
                                 else:
-                                    rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": "verification_failed"}
+                                    rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": result_error or "verification_failed"}
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         # Pick the least loaded replica and submit
