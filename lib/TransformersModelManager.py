@@ -194,9 +194,9 @@ class TransformersModelManager:
                             # FP8 checkpoints are already compressed; using a 3GiB headroom on 24GiB cards
                             # can force unnecessary disk offload. Keep only a small safety margin by default.
                             try:
-                                headroom_gib = float(os.getenv("FP8_GPU_HEADROOM_GIB", "1.0"))
+                                headroom_gib = float(os.getenv("FP8_GPU_HEADROOM_GIB", "0.0"))
                             except Exception:
-                                headroom_gib = 1.0
+                                headroom_gib = 0.0
                         else:
                             try:
                                 headroom_gib = float(os.getenv("GPU_HEADROOM_GIB", "3.0"))
@@ -204,6 +204,9 @@ class TransformersModelManager:
                                 headroom_gib = 3.0
                         for i in range(num_gpus):
                             total_gb = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+                            # FP8 on 2x4090 usually needs ~23GiB per card budget to avoid disk offload.
+                            # Clamp headroom >= 0 to avoid accidental overcommit from env misconfiguration.
+                            headroom_gib = max(0.0, headroom_gib)
                             per_gpu_budget = max(1, int(total_gb - headroom_gib))
                             max_memory[i] = f"{per_gpu_budget}GiB"
                         print(f"[model-load] Auto-detected {num_gpus} GPUs, "
@@ -288,9 +291,20 @@ class TransformersModelManager:
                 if is_bnb_quantized:
                     self.current_gpu_model = self._load_bnb_model_with_retries(dtype_kwargs)
                 else:
-                    # FP8 defaults should avoid disk offload on 2x4090; use "auto" unless explicitly overridden.
-                    default_device_map = "auto" if is_fp8_checkpoint else "balanced"
-                    device_map_env = os.getenv("DEVICE_MAP", default_device_map)
+                    # FP8 defaults should avoid disk offload on 2x4090; use "auto".
+                    # If the environment still sets DEVICE_MAP=balanced from older configs,
+                    # auto-upgrade it unless FORCE_DEVICE_MAP=1 is explicitly set.
+                    raw_device_map_env = os.getenv("DEVICE_MAP")
+                    if is_fp8_checkpoint:
+                        if raw_device_map_env is None:
+                            device_map_env = "auto"
+                        elif raw_device_map_env == "balanced" and os.getenv("FORCE_DEVICE_MAP", "0") != "1":
+                            print("[model-load] FP8 detected: overriding DEVICE_MAP='balanced' -> 'auto' (set FORCE_DEVICE_MAP=1 to keep balanced)")
+                            device_map_env = "auto"
+                        else:
+                            device_map_env = raw_device_map_env
+                    else:
+                        device_map_env = raw_device_map_env or "balanced"
                     allow_disk_offload = os.getenv("ALLOW_DISK_OFFLOAD", "0") == "1"
                     print(
                         f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}, "
@@ -308,10 +322,26 @@ class TransformersModelManager:
                         os.makedirs(offload_folder, exist_ok=True)
                         load_kwargs["offload_folder"] = offload_folder
                         print(f"[model-load] offload_folder='{offload_folder}'")
-                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
-                        **load_kwargs,
-                    )
+                    try:
+                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                            self.model_config.model_name,
+                            **load_kwargs,
+                        )
+                    except Exception as e:
+                        # Some MoE checkpoints require offload_folder whenever device_map spills to disk.
+                        # Retry once with offload_folder so we can still inspect hf_device_map and fail fast
+                        # with a clear reason if ALLOW_DISK_OFFLOAD=0.
+                        if (not allow_disk_offload) and ("Please provide an `offload_folder`" in str(e)):
+                            offload_folder = os.getenv("OFFLOAD_FOLDER", "/tmp/uomi_model_offload")
+                            os.makedirs(offload_folder, exist_ok=True)
+                            load_kwargs["offload_folder"] = offload_folder
+                            print(f"[model-load] Retrying with offload_folder='{offload_folder}' due loader requirement")
+                            self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
+                                self.model_config.model_name,
+                                **load_kwargs,
+                            )
+                        else:
+                            raise
                     print(f"[model-load] Loaded with AutoModelForCausalLM")
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
