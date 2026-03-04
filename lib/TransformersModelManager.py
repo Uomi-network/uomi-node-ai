@@ -303,14 +303,15 @@ class TransformersModelManager:
                         **self.model_config.model_kwargs,
                     )
                 else:
-                    # 'balanced' spreads layers evenly across GPUs so no single GPU
-                    # gets overloaded during the MoE weight-merge step.
                     device_map_env = os.getenv("DEVICE_MAP", "balanced")
-                    print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
+                    offload_folder = os.getenv("OFFLOAD_FOLDER", "/tmp/uomi_model_offload")
+                    os.makedirs(offload_folder, exist_ok=True)
+                    print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}, offload_folder='{offload_folder}'")
                     self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
                         self.model_config.model_name,
                         device_map=device_map_env,
                         max_memory=max_memory,
+                        offload_folder=offload_folder,
                         cache_dir=MODELS_FOLDER,
                         **dtype_kwargs,
                         **self.model_config.model_kwargs,
