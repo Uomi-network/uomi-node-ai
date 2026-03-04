@@ -59,9 +59,9 @@ try:
     import inspect as _inspect
     _param_sig = _inspect.signature(_orig_param_new)
     if '_is_hf_initialized' not in _param_sig.parameters and '**' not in str(_param_sig):
-        def _patched_param_new(cls, *args, **kwargs):
+        def _patched_param_new(cls, *args, _orig=_orig_param_new, **kwargs):
             kwargs.pop('_is_hf_initialized', None)
-            return _orig_param_new(cls, *args, **kwargs)
+            return _orig(cls, *args, **kwargs)
         _torch_nn.Parameter.__new__ = _patched_param_new
         print("[bnb-compat] Patched torch.nn.Parameter.__new__ to accept _is_hf_initialized")
     del _orig_param_new, _param_sig

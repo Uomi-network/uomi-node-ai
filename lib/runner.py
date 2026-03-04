@@ -6,6 +6,7 @@ from lib.config import BATCH_WAIT_SEC, BATCH_MAX_SIZE, TRANSFORMERS_INFERENCE_MA
 from lib.executors import ChatExecutor, ImageExecutor
 from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
 from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B_A3B_FP8_MODEL_CONFIG, TransformersModelManager
+from lib.VLLMModelManager import QWEN35_35B_A3B_FP8_VLLM_CONFIG, VLLMModelManager
 
 # Active model config:
 #   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, RECOMMENDED
@@ -96,35 +97,36 @@ class RunnerExecutor:
                 if max_replicas > 0:
                     target_gpus = target_gpus[:max_replicas]
                 if ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_FP8_MODEL_CONFIG:
-                    # FP8 path: single model instance distributed across GPUs.
-                    candidate_configs = [ACTIVE_MODEL_CONFIG]
-                    allow_fallback = os.getenv("QWEN_FALLBACK_ON_LOAD_FAILURE", "0") == "1"
-                    if allow_fallback:
-                        candidate_configs.append(QWEN35_35B_A3B_MODEL_CONFIG)
-
+                    # FP8 path: use vLLM which handles tensor parallelism and FP8 natively.
+                    # Falls back to TransformersModelManager if vLLM is not installed.
+                    print(f"🔧 Spawning vLLM instance of {QWEN35_35B_A3B_FP8_VLLM_CONFIG.model_name} "
+                          f"(tensor_parallel_size={QWEN35_35B_A3B_FP8_VLLM_CONFIG.tensor_parallel_size})")
                     last_error = None
-                    for cfg in candidate_configs:
-                        print(f"🔧 Spawning single multi-GPU instance of {cfg.model_name} across {len(target_gpus)} GPU(s)")
-                        try:
-                            tm = TransformersModelManager(cfg)
-                            tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
-                            self.transformers_model_managers.append(tm)
-                            self.active_model_name = cfg.model_name
-                            if cfg is not ACTIVE_MODEL_CONFIG:
-                                print(f"⚠️  Falling back from {ACTIVE_MODEL_CONFIG.model_name} to {cfg.model_name}")
-                            break
-                        except Exception as e:
-                            last_error = e
-                            print(f"❌ Failed to spawn multi-GPU instance ({cfg.model_name}): {e}")
-                            try:
-                                import gc
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                            except Exception:
-                                pass
+                    try:
+                        tm = VLLMModelManager(QWEN35_35B_A3B_FP8_VLLM_CONFIG)
+                        tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                        self.transformers_model_managers.append(tm)
+                        self.active_model_name = QWEN35_35B_A3B_FP8_VLLM_CONFIG.model_name
+                    except Exception as e:
+                        last_error = e
+                        print(f"❌ vLLM load failed: {e}")
+                        # Fallback to transformers if explicitly allowed
+                        if os.getenv("QWEN_FALLBACK_ON_LOAD_FAILURE", "0") == "1":
+                            fallback_configs = [QWEN35_35B_A3B_FP8_MODEL_CONFIG, QWEN35_35B_A3B_MODEL_CONFIG]
+                            for cfg in fallback_configs:
+                                print(f"⚠️  Trying transformers fallback: {cfg.model_name}")
+                                try:
+                                    tm = TransformersModelManager(cfg)
+                                    tm.enable_continuous(max_active=BATCH_MAX_SIZE, use_fast=use_fast)
+                                    self.transformers_model_managers.append(tm)
+                                    self.active_model_name = cfg.model_name
+                                    last_error = None
+                                    break
+                                except Exception as fe:
+                                    last_error = fe
+                                    print(f"❌ Transformers fallback failed ({cfg.model_name}): {fe}")
                     if not self.transformers_model_managers and last_error is not None:
-                        print(f"❌ All multi-GPU model load attempts failed. Last error: {last_error}")
+                        print(f"❌ All model load attempts failed. Last error: {last_error}")
                 elif ACTIVE_MODEL_CONFIG is QWEN35_35B_A3B_MODEL_CONFIG:
                     # BnB 8-bit path: single instance distributed across all GPUs (~35GB across 2x 4090).
                     self.active_model_name = ACTIVE_MODEL_CONFIG.model_name
