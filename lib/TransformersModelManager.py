@@ -2,11 +2,24 @@ import math
 import os
 import time
 
+# Set CUDA allocator options at import time — BEFORE any CUDA context is initialised.
+# expandable_segments:True lets the allocator satisfy large mid-load allocations
+# (e.g. MoE expert merge buffers) without OOM even when the heap looks fragmented.
+# This MUST happen before the first torch.cuda call, so we do it here at module level.
+_alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
+_alloc_parts = [p for p in _alloc_conf.split(',') if p]
+if 'expandable_segments' not in _alloc_conf:
+    _alloc_parts.append('expandable_segments:True')
+if 'max_split_size_mb' not in _alloc_conf:
+    _alloc_parts.append(f'max_split_size_mb:{os.environ.get("PYTORCH_MAX_SPLIT_MB", "256")}')
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(_alloc_parts)
+del _alloc_conf, _alloc_parts
+
 import torch
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
+from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
 from transformers import (
@@ -198,16 +211,8 @@ class TransformersModelManager:
                               f"({'inflated for FP8/compressed dtype' if uses_compressed_dtype else 'standard'}), "
                               f"setting max_memory={max_memory}")
 
-            # Ensure allocator can grow instead of fragmenting when large blocks are requested mid-load
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                alloc_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
-                alloc_parts = [part for part in alloc_conf.split(',') if part]
-                if 'expandable_segments' not in alloc_conf:
-                    alloc_parts.append('expandable_segments:True')
-                if 'max_split_size_mb' not in alloc_conf:
-                    max_split_mb = os.getenv('PYTORCH_MAX_SPLIT_MB', '256')
-                    alloc_parts.append(f'max_split_size_mb:{max_split_mb}')
-                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(alloc_parts)
+            # PYTORCH_CUDA_ALLOC_CONF (expandable_segments, max_split_size_mb) is set
+            # at module import time above — nothing to do here.
 
             # load_checkpoint_and_dispatch loads raw FP16/BF16 weights and cannot apply bitsandbytes
             # quantization. For BnB-quantized models, quantization MUST happen inside from_pretrained.
@@ -317,31 +322,41 @@ class TransformersModelManager:
                 else:
                     device_map_env = os.getenv("DEVICE_MAP", "auto")
                     print(f"[model-load] Using device_map='{device_map_env}', max_memory={max_memory}")
-                    try:
-                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                            self.model_config.model_name,
-                            device_map=device_map_env,
-                            max_memory=max_memory,
-                            cache_dir=MODELS_FOLDER,
-                            **dtype_kwargs,
-                            **self.model_config.model_kwargs
-                        )
-                    except Exception as e:
-                        print(f"[model-load] device_map='{device_map_env}' failed ({e}); retrying with 'auto'")
+                    # Try AutoModelForVision2Seq first so that VLM checkpoints (e.g. Qwen3.5-A3B-FP8)
+                    # have ALL their weights (visual encoder, MTP heads, expert layers) properly
+                    # distributed by Accelerate across all GPUs.  If loaded with AutoModelForCausalLM,
+                    # those "unexpected" tensors pile up temporarily on a single GPU and cause OOM
+                    # during the MoE expert-merge (MergeModulelist / torch.stack) step.
+                    _load_kwargs = dict(
+                        device_map=device_map_env,
+                        max_memory=max_memory,
+                        cache_dir=MODELS_FOLDER,
+                        **dtype_kwargs,
+                        **self.model_config.model_kwargs,
+                    )
+                    _loaded = False
+                    for _ModelCls in (AutoModelForVision2Seq, AutoModelForCausalLM):
                         try:
-                            del self.current_gpu_model
-                        except AttributeError:
-                            pass
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                            self.model_config.model_name,
-                            device_map='auto',
-                            cache_dir=MODELS_FOLDER,
-                            **dtype_kwargs,
-                            **self.model_config.model_kwargs
+                            self.current_gpu_model = _ModelCls.from_pretrained(
+                                self.model_config.model_name, **_load_kwargs
+                            )
+                            print(f"[model-load] Loaded with {_ModelCls.__name__}")
+                            _loaded = True
+                            break
+                        except Exception as _e:
+                            print(f"[model-load] {_ModelCls.__name__} failed: {_e}")
+                            try:
+                                del self.current_gpu_model
+                            except AttributeError:
+                                pass
+                            import gc
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    if not _loaded:
+                        raise RuntimeError(
+                            f"All model classes failed to load {self.model_config.model_name}. "
+                            "Check VRAM, model name, and transformers version."
                         )
         
         # Only move model if device_map was NOT used (to preserve multi-GPU distribution)
