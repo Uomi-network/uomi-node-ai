@@ -19,7 +19,11 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer, BitsAndBytesConfig, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
+try:
+    from transformers import AutoModelForVision2Seq  # available in transformers >= 4.34
+except ImportError:
+    AutoModelForVision2Seq = None  # type: ignore
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
 from transformers import LogitsProcessor
 from transformers import (
@@ -335,7 +339,7 @@ class TransformersModelManager:
                         **self.model_config.model_kwargs,
                     )
                     _loaded = False
-                    for _ModelCls in (AutoModelForVision2Seq, AutoModelForCausalLM):
+                    for _ModelCls in filter(None, (AutoModelForVision2Seq, AutoModelForCausalLM)):
                         try:
                             self.current_gpu_model = _ModelCls.from_pretrained(
                                 self.model_config.model_name, **_load_kwargs
