@@ -8,19 +8,20 @@ from lib.TestModelManager import TEST_MODEL_CONFIG, TestModelManager
 from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B_A3B_FP8_MODEL_CONFIG, TransformersModelManager
 
 # Active model config:
-#   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, recommended
-#   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB NF4 4-bit (needs bitsandbytes)
+#   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, RECOMMENDED
+#   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB int8 (needs bitsandbytes with matching CUDA binary)
 def _select_active_model_config():
-    # Deterministic default: BnB 4-bit is currently the most stable path on 2x4090
-    # with this custom HF loader stack.
-    variant = os.getenv("QWEN_MODEL_VARIANT", "bnb").strip().lower()
-    if variant in {"4bit", "bnb", "nf4", "qwen3.5-35b-a3b"}:
+    # Default: FP8 — native 8-bit weights, no bitsandbytes dependency, RTX 4090 has HW FP8 support.
+    # The BnB path requires a bitsandbytes build whose CUDA binary matches the runtime exactly;
+    # this is fragile across CUDA 12.x versions and dev builds.  FP8 avoids this entirely.
+    variant = os.getenv("QWEN_MODEL_VARIANT", "fp8").strip().lower()
+    if variant in {"4bit", "bnb", "nf4", "8bit", "int8", "qwen3.5-35b-a3b"}:
         return QWEN35_35B_A3B_MODEL_CONFIG
     return QWEN35_35B_A3B_FP8_MODEL_CONFIG
 
 
 ACTIVE_MODEL_CONFIG = _select_active_model_config()
-print(f"[runner] ACTIVE_MODEL_CONFIG={ACTIVE_MODEL_CONFIG.model_name} (QWEN_MODEL_VARIANT={os.getenv('QWEN_MODEL_VARIANT', 'bnb')})")
+print(f"[runner] ACTIVE_MODEL_CONFIG={ACTIVE_MODEL_CONFIG.model_name} (QWEN_MODEL_VARIANT={os.getenv('QWEN_MODEL_VARIANT', 'fp8')})")
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
