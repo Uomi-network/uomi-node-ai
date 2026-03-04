@@ -241,12 +241,12 @@ class TransformersModelManager:
                     else:
                         max_memory = {}
                         if is_fp8_checkpoint:
-                            # FP8 checkpoints are already compressed; using a 3GiB headroom on 24GiB cards
-                            # can force unnecessary disk offload. Keep only a small safety margin by default.
+                            # FP8 model ~37.5 GB across 2x 24 GiB cards → ~19 GB/GPU.
+                            # Need 3-4 GiB headroom per GPU for loading buffers and KV cache.
                             try:
-                                headroom_gib = float(os.getenv("FP8_GPU_HEADROOM_GIB", "0.0"))
+                                headroom_gib = float(os.getenv("FP8_GPU_HEADROOM_GIB", "3.0"))
                             except Exception:
-                                headroom_gib = 0.0
+                                headroom_gib = 3.0
                         else:
                             try:
                                 headroom_gib = float(os.getenv("GPU_HEADROOM_GIB", "3.0"))
@@ -341,18 +341,11 @@ class TransformersModelManager:
                 if is_bnb_quantized:
                     self.current_gpu_model = self._load_bnb_model_with_retries(dtype_kwargs)
                 else:
-                    # FP8 defaults should avoid disk offload on 2x4090; use "auto".
-                    # If the environment still sets DEVICE_MAP=balanced from older configs,
-                    # auto-upgrade it unless FORCE_DEVICE_MAP=1 is explicitly set.
+                    # "balanced" distributes layers evenly across GPUs (critical for multi-GPU).
+                    # "auto" is greedy and fills GPU 0 first → OOM on 2x4090 with 37.5 GB FP8 model.
                     raw_device_map_env = os.getenv("DEVICE_MAP")
                     if is_fp8_checkpoint:
-                        if raw_device_map_env is None:
-                            device_map_env = "auto"
-                        elif raw_device_map_env == "balanced" and os.getenv("FORCE_DEVICE_MAP", "0") != "1":
-                            print("[model-load] FP8 detected: overriding DEVICE_MAP='balanced' -> 'auto' (set FORCE_DEVICE_MAP=1 to keep balanced)")
-                            device_map_env = "auto"
-                        else:
-                            device_map_env = raw_device_map_env
+                        device_map_env = raw_device_map_env or "balanced"
                     else:
                         device_map_env = raw_device_map_env or "balanced"
                     allow_disk_offload = os.getenv("ALLOW_DISK_OFFLOAD", "0") == "1"
