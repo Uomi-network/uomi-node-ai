@@ -16,7 +16,7 @@ del _alloc_conf, _alloc_parts
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any
+from typing import Dict, Any, List
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 from lib.config import MODELS_FOLDER, TRANSFORMERS_INFERENCE_MAX_TOKENS, TRANSFORMERS_INFERENCE_TEMPERATURE, USE_KV_CACHE
@@ -230,17 +230,15 @@ class TransformersModelManager:
                         # are evenly split without ever requesting >1GiB contiguous chunks on a single GPU.
                         block_map: Dict[str, str] = {}
                         current_gpu = 0
-                        module_prefix = getattr(cfg, 'architectures', [''])[0] if getattr(cfg, 'architectures', None) else ''
                         total_layers = getattr(cfg, 'num_hidden_layers', 0)
                         for layer_idx in range(total_layers):
                             key = f"model.layers.{layer_idx}"
                             block_map[key] = f"cuda:{current_gpu}"
                             current_gpu = (current_gpu + 1) % torch.cuda.device_count()
                         # Ensure the embedding and lm_head live on GPU0 to avoid host/device transfers
-                        embed_key = f"{module_prefix}.embed_tokens" if module_prefix else "model.embed_tokens"
-                        head_key = f"{module_prefix}.lm_head" if module_prefix else "lm_head"
-                        block_map[embed_key] = "cuda:0"
-                        block_map[head_key] = "cuda:0"
+                        block_map["model.embed_tokens"] = "cuda:0"
+                        block_map["model.norm"] = "cuda:0"
+                        block_map["lm_head"] = "cuda:0"
                         device_map_value = block_map
                     dispatch_kwargs = {
                         "device_map": device_map_value,
@@ -273,18 +271,7 @@ class TransformersModelManager:
                     dtype_kwargs["torch_dtype"] = load_dtype
 
                 if is_bnb_quantized:
-                    # Official HuggingFace approach: device_map="auto" without max_memory.
-                    # Newer versions of accelerate (0.27+) correctly plan device placement
-                    # using 4-bit sizes instead of BF16 sizes, so no inflation is needed.
-                    device_map_env = os.getenv("DEVICE_MAP", "auto")
-                    print(f"[model-load] BnB multi-GPU load: device_map='{device_map_env}' (no max_memory override)")
-                    self.current_gpu_model = AutoModelForCausalLM.from_pretrained(
-                        self.model_config.model_name,
-                        device_map=device_map_env,
-                        cache_dir=MODELS_FOLDER,
-                        **dtype_kwargs,
-                        **self.model_config.model_kwargs,
-                    )
+                    self.current_gpu_model = self._load_bnb_model_with_retries(dtype_kwargs)
                 else:
                     device_map_env = os.getenv("DEVICE_MAP", "balanced")
                     offload_folder = os.getenv("OFFLOAD_FOLDER", "/tmp/uomi_model_offload")
@@ -353,6 +340,112 @@ class TransformersModelManager:
         # Continuous batcher disabled by default
         self.continuous_batcher: ContinuousBatcher | None = None
         self.fast_continuous_batcher: FastContinuousBatcher | None = None
+
+    def _build_round_robin_device_map(self) -> Dict[str, str] | None:
+        """Build a deterministic layer-wise map for Qwen-style decoder stacks."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return None
+        try:
+            cfg = AutoConfig.from_pretrained(
+                self.model_config.model_name,
+                cache_dir=MODELS_FOLDER,
+                trust_remote_code=self.model_config.model_kwargs.get("trust_remote_code", False),
+            )
+            total_layers = int(getattr(cfg, "num_hidden_layers", 0))
+            if total_layers <= 0:
+                return None
+            device_count = torch.cuda.device_count()
+            block_map: Dict[str, str] = {}
+            for layer_idx in range(total_layers):
+                block_map[f"model.layers.{layer_idx}"] = f"cuda:{layer_idx % device_count}"
+            # Keep shared heads on GPU0 so logits computation stays local.
+            block_map["model.embed_tokens"] = "cuda:0"
+            block_map["model.norm"] = "cuda:0"
+            block_map["lm_head"] = "cuda:0"
+            return block_map
+        except Exception as e:
+            print(f"[model-load] Could not build round-robin device_map: {e}")
+            return None
+
+    def _build_bnb_retry_max_memory(self) -> Dict[int, str] | None:
+        """Inflate max_memory for BnB retries to counter internal 0.9 safety shrink."""
+        if not torch.cuda.is_available():
+            return None
+        try:
+            headroom_gib = float(os.getenv("BNB_RETRY_HEADROOM_GIB", "1.0"))
+        except Exception:
+            headroom_gib = 1.0
+        budgets: Dict[int, str] = {}
+        for gid in range(torch.cuda.device_count()):
+            total_gib = torch.cuda.get_device_properties(gid).total_memory / (1024 ** 3)
+            post_adjust_target = max(1.0, total_gib - headroom_gib)
+            # transformers BnB quantizer multiplies max_memory by 0.9 internally.
+            pre_adjust_budget = max(1, int(post_adjust_target / 0.90))
+            budgets[gid] = f"{pre_adjust_budget}GiB"
+        return budgets
+
+    def _load_bnb_model_with_retries(self, dtype_kwargs: Dict[str, Any]):
+        """Load 4-bit BnB model with GPU-only retry strategies when auto map spills to CPU."""
+        device_map_env = os.getenv("DEVICE_MAP", "auto")
+        print(f"[model-load] BnB multi-GPU load attempt: device_map='{device_map_env}'")
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                self.model_config.model_name,
+                device_map=device_map_env,
+                cache_dir=MODELS_FOLDER,
+                **dtype_kwargs,
+                **self.model_config.model_kwargs,
+            )
+        except Exception as first_err:
+            err_str = str(first_err)
+            should_retry = (
+                torch.cuda.is_available()
+                and torch.cuda.device_count() > 1
+                and (
+                    "Some modules are dispatched on the CPU or the disk" in err_str
+                    or "doesn't have enough GPU RAM" in err_str
+                )
+            )
+            if not should_retry:
+                raise
+
+            print("[model-load] BnB auto device_map spilled to CPU/disk; retrying with GPU-only maps")
+            retry_maps: List[Dict[str, str] | str] = []
+            if device_map_env != "balanced_low_0":
+                retry_maps.append("balanced_low_0")
+            if device_map_env != "balanced":
+                retry_maps.append("balanced")
+            round_robin_map = self._build_round_robin_device_map()
+            if round_robin_map is not None:
+                retry_maps.append(round_robin_map)
+
+            retry_max_memory = self._build_bnb_retry_max_memory()
+            last_err: Exception = first_err
+            for idx, retry_map in enumerate(retry_maps, start=1):
+                map_label = retry_map if isinstance(retry_map, str) else f"round_robin({len(retry_map)} entries)"
+                print(
+                    f"[model-load] BnB retry {idx}/{len(retry_maps)} with device_map={map_label}, "
+                    f"max_memory={retry_max_memory}"
+                )
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.model_config.model_name,
+                        device_map=retry_map,
+                        max_memory=retry_max_memory,
+                        cache_dir=MODELS_FOLDER,
+                        **dtype_kwargs,
+                        **self.model_config.model_kwargs,
+                    )
+                    print(f"[model-load] BnB retry {idx} succeeded")
+                    return model
+                except Exception as retry_err:
+                    last_err = retry_err
+                    print(f"[model-load] BnB retry {idx} failed: {retry_err}")
+
+            raise RuntimeError(
+                "BnB load failed after GPU-only retries. "
+                "If this node has 2x RTX 4090, prefer QWEN_MODEL_VARIANT=fp8."
+            ) from last_err
 
     def _resolve_input_device(self) -> str:
         """Determine the device inputs should be placed on for generate().

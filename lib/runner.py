@@ -10,7 +10,15 @@ from lib.TransformersModelManager import QWEN35_35B_A3B_MODEL_CONFIG, QWEN35_35B
 # Active model config:
 #   QWEN35_35B_A3B_FP8_MODEL_CONFIG  → FP8 weights (37.5 GB), fits 2x RTX 4090 natively, recommended
 #   QWEN35_35B_A3B_MODEL_CONFIG      → BF16 + BnB NF4 4-bit (needs bitsandbytes)
-ACTIVE_MODEL_CONFIG = QWEN35_35B_A3B_MODEL_CONFIG
+def _select_active_model_config():
+    variant = os.getenv("QWEN_MODEL_VARIANT", "fp8").strip().lower()
+    if variant in {"4bit", "bnb", "nf4", "qwen3.5-35b-a3b"}:
+        return QWEN35_35B_A3B_MODEL_CONFIG
+    return QWEN35_35B_A3B_FP8_MODEL_CONFIG
+
+
+ACTIVE_MODEL_CONFIG = _select_active_model_config()
+print(f"[runner] ACTIVE_MODEL_CONFIG={ACTIVE_MODEL_CONFIG.model_name} (QWEN_MODEL_VARIANT={os.getenv('QWEN_MODEL_VARIANT', 'fp8')})")
 import torch
 # from lib.SanaModelManager import SANA_MODEL_CONFIG, SanaModelManager
 
@@ -281,4 +289,3 @@ class RunnerExecutor:
         except Exception:
             print(f"[scheduler] chosen replica load={loads[0][1]}")
         return chosen
-
