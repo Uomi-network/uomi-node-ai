@@ -24,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -218,36 +220,118 @@ class VLLMModelManager:
     # Internal generation
     # ------------------------------------------------------------------
 
-    def _topk_ids_from_logprobs(self, top_logprobs: list) -> set:
+    def _topk_ids_from_logprobs_dict(self, top_lp_dict: Dict[str, float]) -> set:
         """
-        Convert OpenAI-format top_logprobs entries to a set of token IDs.
-
-        Each entry is {"token": str, "logprob": float, "bytes": [int, ...]}.
-        Two strategies are tried in order for each entry:
-          1. tokenizer.encode(token_text) — works for most standard tokens.
-          2. tokenizer.convert_tokens_to_ids(token_text) — works for raw vocab tokens
-             that encode() would split differently.
+        Convert a completions-API top_logprobs dict {token_text: logprob} to token IDs.
+        Tries encode() first (handles decoded text), then convert_tokens_to_ids()
+        (handles raw vocab tokens like 'Ġhello' or byte-level tokens).
         """
         if self._tokenizer is None:
             return set()
         top_ids: set = set()
-        for lp in top_logprobs:
-            tok_text = lp.get("token", "")
-            # Strategy 1: encode the decoded token text directly.
+        for tok_text in top_lp_dict.keys():
             try:
                 ids = self._tokenizer.encode(tok_text, add_special_tokens=False)
                 if len(ids) == 1:
                     top_ids.add(ids[0])
             except Exception:
                 pass
-            # Strategy 2: direct vocab lookup (handles raw BPE / SentencePiece tokens).
             try:
-                tok_id = self._tokenizer.convert_tokens_to_ids(tok_text)
-                if isinstance(tok_id, int) and tok_id != self._tokenizer.unk_token_id:
-                    top_ids.add(tok_id)
+                tid = self._tokenizer.convert_tokens_to_ids(tok_text)
+                if isinstance(tid, int):
+                    top_ids.add(tid)
             except Exception:
                 pass
         return top_ids
+
+    def _verify_topk(
+        self,
+        messages: List[Dict],
+        enable_thinking: bool,
+        forced_tokens: List[int],
+        topk_verify: int,
+    ) -> Optional[bool]:
+        """
+        Verify that each forced token was within the top-K candidates at its position,
+        using /v1/completions with echo=True.
+
+        This is the only correct approach for top-K verification with temperature > 0:
+        the logprob at position i is computed given the CORRECT prefix
+        (forced_tokens[0..i-1]), not a freely-generated diverged prefix.
+
+        Returns True (pass), False (fail), or None (cannot verify — caller decides).
+        """
+        if self._tokenizer is None:
+            print("[verify-log] _verify_topk: no tokenizer, cannot verify")
+            return None
+        try:
+            # Build token ID list: apply_chat_template + forced response tokens.
+            # Passing token IDs directly to /v1/completions avoids any text
+            # boundary re-tokenization artefacts.
+            try:
+                prompt_ids: List[int] = list(self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                ))
+            except TypeError:
+                prompt_ids = list(self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                ))
+
+            full_ids: List[int] = prompt_ids + list(forced_tokens)
+            n_prompt = len(prompt_ids)
+            n_resp = len(forced_tokens)
+
+            print(f"[verify-log] completions echo: n_prompt={n_prompt} n_resp={n_resp} topk={topk_verify}")
+
+            payload: Dict[str, Any] = {
+                "model": self.model_name,
+                "prompt": full_ids,      # token IDs → no tokenization boundary issues
+                "max_tokens": 1,         # 1 extra token so vLLM returns echo logprobs
+                "logprobs": topk_verify,
+                "echo": True,
+                "temperature": 0,
+            }
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._base_url}/v1/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                comp_data = json.loads(resp.read())
+
+            lp_data = comp_data["choices"][0].get("logprobs") or {}
+            # completions logprobs: {"tokens": [...], "top_logprobs": [{tok: logp}, ...]}
+            all_top_lp: List[Dict] = lp_data.get("top_logprobs") or []
+            resp_lp = all_top_lp[n_prompt: n_prompt + n_resp]
+
+            print(f"[verify-log] logprobs returned: total={len(all_top_lp)} response_slice={len(resp_lp)}")
+
+            if len(resp_lp) < n_resp:
+                print(f"[verify-log] FAIL: logprobs too short ({len(resp_lp)} < {n_resp})")
+                return False
+
+            for i, (forced_id, top_lp_dict) in enumerate(zip(forced_tokens, resp_lp)):
+                top_ids = self._topk_ids_from_logprobs_dict(top_lp_dict or {})
+                if int(forced_id) not in top_ids:
+                    forced_text = ""
+                    try:
+                        forced_text = self._tokenizer.decode([int(forced_id)], skip_special_tokens=True)
+                    except Exception:
+                        pass
+                    top_sample = list(top_lp_dict.keys())[:5] if top_lp_dict else []
+                    print(f"[verify-log] FAIL pos {i}: forced_id={forced_id} ('{forced_text}') "
+                          f"not in top-{topk_verify}. Top candidates: {top_sample}")
+                    return False
+
+            print(f"[verify-log] PASS: all {n_resp} tokens verified in top-{topk_verify}")
+            return True
+
+        except Exception as exc:
+            print(f"[verify-log] _verify_topk error: {exc}")
+            return None
 
     def _encode_tokens(self, text: str) -> List[int]:
         """
@@ -274,20 +358,43 @@ class VLLMModelManager:
         forced_tokens: Optional[List[int]],
         tools: Optional[List[Dict]] = None,
     ):
-        import urllib.request, urllib.error
-
         try:
+            # ------------------------------------------------------------------
+            # CHECK PATH: top-K verification via /v1/completions echo=True.
+            # No re-generation: evaluate logprobs of the forced tokens with the
+            # correct prefix context at every position.
+            # ------------------------------------------------------------------
+            if is_check and forced_tokens is not None:
+                topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "10"))
+                verified_opt = self._verify_topk(messages, enable_thinking, list(forced_tokens), topk_verify)
+                verified = bool(verified_opt) if verified_opt is not None else False
+                if verified_opt is None:
+                    print("[verify-log] top-K unavailable (no tokenizer or API error), marking failed")
+
+                response_text = self._tokenizer.decode(list(forced_tokens), skip_special_tokens=True) if self._tokenizer else ""
+                generated_ids = list(forced_tokens)
+
+                for i, tid in enumerate(generated_ids):
+                    try:
+                        tok_text = self._tokenizer.decode([tid], skip_special_tokens=True) if self._tokenizer else ""
+                        on_token(sid, tok_text, {"id": int(tid), "index": i})
+                    except Exception:
+                        pass
+
+                proof_obj: Dict[str, Any] = {"tokens": [{"id": int(t)} for t in generated_ids], "verified": verified}
+                if not verified:
+                    proof_obj["error"] = "token_mismatch"
+                on_complete(sid, response_text, proof_obj)
+                return
+
+            # ------------------------------------------------------------------
+            # GENERATE PATH
+            # ------------------------------------------------------------------
             temperature = float(sampling_cfg.get("temperature", 0.7))
             top_k = int(sampling_cfg.get("top_k", 5))
-            n_tokens = len(forced_tokens) if (is_check and forced_tokens) else max_new_tokens
-            # Clamp to max_model_len to avoid vLLM bad_request errors
-            n_tokens = min(n_tokens, self.model_config.max_model_len)
+            n_tokens = min(max_new_tokens, self.model_config.max_model_len)
 
-            # Qwen3.5 thinking mode is controlled via chat_template_kwargs in extra_body.
-            # The /think and /no_think soft-switches are NOT supported on Qwen3.5.
-            #
             # vLLM strictly requires tool_calls in assistant messages to have an `id` field.
-            # Inject a stable id if missing so callers don't need to track it.
             patched_messages = []
             for m in messages:
                 m = dict(m)
@@ -302,8 +409,6 @@ class VLLMModelManager:
                     m["tool_calls"] = fixed_calls
                 patched_messages.append(m)
 
-            topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "10"))
-
             payload: Dict[str, Any] = {
                 "model": self.model_name,
                 "messages": patched_messages,
@@ -313,11 +418,6 @@ class VLLMModelManager:
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": enable_thinking},
             }
-            # In check mode request logprobs so we can do top-K verification
-            # instead of requiring exact token match (which fails with temperature > 0).
-            if is_check and forced_tokens is not None:
-                payload["logprobs"] = True
-                payload["top_logprobs"] = topk_verify
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
@@ -347,13 +447,10 @@ class VLLMModelManager:
             generated_text: str = message.get("content") or ""
             tool_calls = message.get("tool_calls")
             if tool_calls:
-                # Serialize tool_calls to JSON — encoded into token IDs for the proof,
-                # consistently between generate and check runs.
                 tool_calls_str = json.dumps(tool_calls, ensure_ascii=False)
                 generated_text = (generated_text + "\n" + tool_calls_str).strip() if generated_text else tool_calls_str
 
             # Encode the FULL response text in one shot — never chunk-by-chunk.
-            # This guarantees identical token IDs between generate and check runs.
             generated_ids = self._encode_tokens(generated_text)
 
             # Fire on_token for each token (used only for debug logging in runner.py)
@@ -364,39 +461,9 @@ class VLLMModelManager:
                 except Exception:
                     pass
 
-            # Build proof
-            if is_check and forced_tokens is not None:
-                lp_content = (data["choices"][0].get("logprobs") or {}).get("content") or []
-                forced_list = list(forced_tokens)
-
-                if not lp_content or self._tokenizer is None:
-                    # No logprobs available: fall back to exact match
-                    verified = generated_ids == forced_list
-                    print(f"[verify-log] exact-match fallback: verified={verified}")
-                elif len(lp_content) != len(forced_list):
-                    verified = False
-                    print(f"[verify-log] length mismatch: got={len(lp_content)} expected={len(forced_list)}")
-                else:
-                    verified = True
-                    for i, (forced_id, lp_pos) in enumerate(zip(forced_list, lp_content)):
-                        top_ids = self._topk_ids_from_logprobs(lp_pos.get("top_logprobs") or [])
-                        if int(forced_id) not in top_ids:
-                            verified = False
-                            print(f"[verify-log] position {i}: forced_id={forced_id} not in top-{topk_verify} ids={top_ids}")
-                            break
-                    if verified:
-                        print(f"[verify-log] top-{topk_verify} verification passed ({len(forced_list)} tokens)")
-
-                proof: Dict[str, Any] = {
-                    "tokens": [{"id": int(t)} for t in generated_ids],
-                    "verified": verified,
-                }
-                if not verified:
-                    proof["error"] = "token_mismatch"
-            else:
-                proof = {
-                    "tokens": [{"id": int(t)} for t in generated_ids],
-                }
+            proof: Dict[str, Any] = {
+                "tokens": [{"id": int(t)} for t in generated_ids],
+            }
 
             on_complete(sid, generated_text, proof)
 
