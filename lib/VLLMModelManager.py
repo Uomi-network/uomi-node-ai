@@ -220,30 +220,6 @@ class VLLMModelManager:
     # Internal generation
     # ------------------------------------------------------------------
 
-    def _topk_ids_from_logprobs_dict(self, top_lp_dict: Dict[str, float]) -> set:
-        """
-        Convert a completions-API top_logprobs dict {token_text: logprob} to token IDs.
-        Tries encode() first (handles decoded text), then convert_tokens_to_ids()
-        (handles raw vocab tokens like 'Ġhello' or byte-level tokens).
-        """
-        if self._tokenizer is None:
-            return set()
-        top_ids: set = set()
-        for tok_text in top_lp_dict.keys():
-            try:
-                ids = self._tokenizer.encode(tok_text, add_special_tokens=False)
-                if len(ids) == 1:
-                    top_ids.add(ids[0])
-            except Exception:
-                pass
-            try:
-                tid = self._tokenizer.convert_tokens_to_ids(tok_text)
-                if isinstance(tid, int):
-                    top_ids.add(tid)
-            except Exception:
-                pass
-        return top_ids
-
     def _verify_topk(
         self,
         messages: List[Dict],
@@ -252,22 +228,25 @@ class VLLMModelManager:
         topk_verify: int,
     ) -> Optional[bool]:
         """
-        Verify that each forced token was within the top-K candidates at its position,
-        using /v1/completions with echo=True.
+        Verify each forced token is within the top-K candidates at its position.
 
-        This is the only correct approach for top-K verification with temperature > 0:
-        the logprob at position i is computed given the CORRECT prefix
-        (forced_tokens[0..i-1]), not a freely-generated diverged prefix.
+        Uses /v1/completions with echo=True and token IDs as prompt.
+        Comparison is purely logprob-based — no token text-to-ID conversion needed:
+          token_logprobs[n_prompt+i]    = log P(forced_tokens[i] | correct prefix)
+          min(top_logprobs[n_prompt+i]) = log P of the K-th best token at that position
+          → passes iff actual_logprob >= kth_logprob
 
         Returns True (pass), False (fail), or None (cannot verify — caller decides).
         """
         if self._tokenizer is None:
-            print("[verify-log] _verify_topk: no tokenizer, cannot verify")
+            print("[verify-log] _verify_topk: no tokenizer")
             return None
+
+        if not forced_tokens:
+            print("[verify-log] FAIL: empty forced_tokens")
+            return False
+
         try:
-            # Build token ID list: apply_chat_template + forced response tokens.
-            # Passing token IDs directly to /v1/completions avoids any text
-            # boundary re-tokenization artefacts.
             try:
                 prompt_ids: List[int] = list(self._tokenizer.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True,
@@ -286,8 +265,8 @@ class VLLMModelManager:
 
             payload: Dict[str, Any] = {
                 "model": self.model_name,
-                "prompt": full_ids,      # token IDs → no tokenization boundary issues
-                "max_tokens": 1,         # 1 extra token so vLLM returns echo logprobs
+                "prompt": full_ids,      # token IDs — no text roundtrip
+                "max_tokens": 1,         # 1 extra token so vLLM echoes the full sequence
                 "logprobs": topk_verify,
                 "echo": True,
                 "temperature": 0,
@@ -303,27 +282,42 @@ class VLLMModelManager:
                 comp_data = json.loads(resp.read())
 
             lp_data = comp_data["choices"][0].get("logprobs") or {}
-            # completions logprobs: {"tokens": [...], "top_logprobs": [{tok: logp}, ...]}
+            # token_logprobs[i] = log P(token_i | token_0..i-1)
+            # top_logprobs[i]   = {token_text: logprob} for top-K at position i
+            token_logprobs: List = lp_data.get("token_logprobs") or []
             all_top_lp: List[Dict] = lp_data.get("top_logprobs") or []
-            resp_lp = all_top_lp[n_prompt: n_prompt + n_resp]
 
-            print(f"[verify-log] logprobs returned: total={len(all_top_lp)} response_slice={len(resp_lp)}")
+            resp_actual_lp = token_logprobs[n_prompt: n_prompt + n_resp]
+            resp_top_lp    = all_top_lp[n_prompt: n_prompt + n_resp]
 
-            if len(resp_lp) < n_resp:
-                print(f"[verify-log] FAIL: logprobs too short ({len(resp_lp)} < {n_resp})")
+            print(f"[verify-log] logprobs: total={len(token_logprobs)} "
+                  f"resp_actual={len(resp_actual_lp)} resp_top={len(resp_top_lp)}")
+
+            if len(resp_actual_lp) < n_resp or len(resp_top_lp) < n_resp:
+                print(f"[verify-log] FAIL: logprobs slice too short ({len(resp_actual_lp)} < {n_resp})")
                 return False
 
-            for i, (forced_id, top_lp_dict) in enumerate(zip(forced_tokens, resp_lp)):
-                top_ids = self._topk_ids_from_logprobs_dict(top_lp_dict or {})
-                if int(forced_id) not in top_ids:
+            for i, (forced_id, actual_lp, top_lp_dict) in enumerate(
+                    zip(forced_tokens, resp_actual_lp, resp_top_lp)):
+                if actual_lp is None:
+                    # First token in a sequence has no preceding context logprob
+                    continue
+                if not top_lp_dict:
+                    print(f"[verify-log] FAIL pos {i}: empty top_logprobs entry")
+                    return False
+                # K-th best logprob = minimum value in the top-K dict.
+                # Token passes iff its actual logprob >= K-th best logprob.
+                kth_logprob = min(top_lp_dict.values())
+                if actual_lp < kth_logprob:
                     forced_text = ""
                     try:
                         forced_text = self._tokenizer.decode([int(forced_id)], skip_special_tokens=True)
                     except Exception:
                         pass
-                    top_sample = list(top_lp_dict.keys())[:5] if top_lp_dict else []
-                    print(f"[verify-log] FAIL pos {i}: forced_id={forced_id} ('{forced_text}') "
-                          f"not in top-{topk_verify}. Top candidates: {top_sample}")
+                    top_sample = list(top_lp_dict.keys())[:5]
+                    print(f"[verify-log] FAIL pos {i}: id={forced_id} ('{forced_text}') "
+                          f"logprob={actual_lp:.4f} < kth={kth_logprob:.4f} "
+                          f"top_tokens={top_sample}")
                     return False
 
             print(f"[verify-log] PASS: all {n_resp} tokens verified in top-{topk_verify}")
