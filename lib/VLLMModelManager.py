@@ -466,6 +466,11 @@ class VLLMModelManager:
             top_k = int(sampling_cfg.get("top_k", 5))
             n_tokens = min(max_new_tokens, self.model_config.max_model_len)
 
+            # Ensure system message is first (Jinja2 chat template requirement)
+            system_msgs = [m for m in messages if m.get("role") == "system"]
+            other_msgs  = [m for m in messages if m.get("role") != "system"]
+            messages = system_msgs + other_msgs
+
             # vLLM strictly requires tool_calls in assistant messages to have an `id` field.
             patched_messages = []
             for m in messages:
