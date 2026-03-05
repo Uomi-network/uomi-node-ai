@@ -466,9 +466,16 @@ class VLLMModelManager:
             top_k = int(sampling_cfg.get("top_k", 5))
             n_tokens = min(max_new_tokens, self.model_config.max_model_len)
 
-            # Ensure system message is first (Jinja2 chat template requirement)
+            # Qwen3 chat template requires exactly one system message at position 0.
+            # Merge multiple system messages into one, then prepend.
             system_msgs = [m for m in messages if m.get("role") == "system"]
             other_msgs  = [m for m in messages if m.get("role") != "system"]
+            if len(system_msgs) > 1:
+                merged = "\n\n".join(
+                    m["content"] if isinstance(m.get("content"), str) else ""
+                    for m in system_msgs
+                )
+                system_msgs = [{"role": "system", "content": merged}]
             messages = system_msgs + other_msgs
 
             # vLLM strictly requires tool_calls in assistant messages to have an `id` field.

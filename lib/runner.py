@@ -210,9 +210,15 @@ class RunnerExecutor:
                         import json
                         payload = json.loads(input_json)
                         messages = payload["messages"]
-                        # Chat templates require system message first
+                        # Qwen3 chat template requires exactly one system message at position 0
                         system_msgs = [m for m in messages if m.get("role") == "system"]
                         other_msgs  = [m for m in messages if m.get("role") != "system"]
+                        if len(system_msgs) > 1:
+                            merged = "\n\n".join(
+                                m["content"] if isinstance(m.get("content"), str) else ""
+                                for m in system_msgs
+                            )
+                            system_msgs = [{"role": "system", "content": merged}]
                         messages = system_msgs + other_msgs
                         tools = payload.get("tools") or None
                         enable_thinking = payload.get("enable_thinking", req["request"].get("enable_thinking", True))
