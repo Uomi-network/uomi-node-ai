@@ -16,6 +16,7 @@ Token / proof contract (MUST be preserved for validator compatibility):
     generate and check runs on the same text.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -205,6 +206,7 @@ class VLLMModelManager:
         is_check: bool = False,
         forced_tokens: Optional[List[int]] = None,
         tools: Optional[List[Dict]] = None,
+        proof_prompt_hash: Optional[str] = None,
     ) -> str:
         sid = uuid.uuid4().hex
         with self._lock:
@@ -212,7 +214,7 @@ class VLLMModelManager:
         self._executor.submit(
             self._run,
             sid, messages, enable_thinking, sampling_cfg,
-            max_new_tokens, on_token, on_complete, is_check, forced_tokens, tools,
+            max_new_tokens, on_token, on_complete, is_check, forced_tokens, tools, proof_prompt_hash,
         )
         return sid
 
@@ -233,12 +235,34 @@ class VLLMModelManager:
                 stop_ids.append(tid)
         return stop_ids
 
+    def _compute_prompt_hash(self, messages: List[Dict], enable_thinking: bool) -> str:
+        """SHA-256 (32 hex chars) of the chat-template token ID sequence."""
+        if self._tokenizer is None:
+            return ""
+        try:
+            try:
+                ids = list(self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                ))
+            except TypeError:
+                ids = list(self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                ))
+            # Encode each token ID as 4 LE bytes for a deterministic byte sequence.
+            raw = b"".join(id_.to_bytes(4, "little") for id_ in ids)
+            return hashlib.sha256(raw).hexdigest()[:32]
+        except Exception as exc:
+            print(f"[verify-log] _compute_prompt_hash error: {exc}")
+            return ""
+
     def _verify_topk(
         self,
         messages: List[Dict],
         enable_thinking: bool,
         forced_tokens: List[int],
         topk_verify: int,
+        proof_prompt_hash: Optional[str] = None,
     ) -> Optional[bool]:
         """
         Verify each forced token is within the top-K candidates at its position.
@@ -263,6 +287,14 @@ class VLLMModelManager:
         if not forced_tokens:
             print("[verify-log] FAIL: empty forced_tokens")
             return False
+
+        # --- Check 0: prompt hash — proof must commit to the exact prompt ---
+        if proof_prompt_hash:
+            actual_hash = self._compute_prompt_hash(messages, enable_thinking)
+            if actual_hash and actual_hash != proof_prompt_hash:
+                print(f"[verify-log] FAIL: prompt_hash mismatch "
+                      f"expected={proof_prompt_hash} got={actual_hash}")
+                return False
 
         # --- Check 2: EOS completeness ---
         stop_ids = self._get_stop_token_ids()
@@ -394,6 +426,7 @@ class VLLMModelManager:
         is_check: bool,
         forced_tokens: Optional[List[int]],
         tools: Optional[List[Dict]] = None,
+        proof_prompt_hash: Optional[str] = None,
     ):
         try:
             # ------------------------------------------------------------------
@@ -403,7 +436,7 @@ class VLLMModelManager:
             # ------------------------------------------------------------------
             if is_check and forced_tokens is not None:
                 topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "5"))
-                verified_opt = self._verify_topk(messages, enable_thinking, list(forced_tokens), topk_verify)
+                verified_opt = self._verify_topk(messages, enable_thinking, list(forced_tokens), topk_verify, proof_prompt_hash)
                 verified = bool(verified_opt) if verified_opt is not None else False
                 if verified_opt is None:
                     print("[verify-log] top-K unavailable (no tokenizer or API error), marking failed")
@@ -506,6 +539,7 @@ class VLLMModelManager:
 
             proof: Dict[str, Any] = {
                 "tokens": [{"id": int(t)} for t in generated_ids],
+                "prompt_hash": self._compute_prompt_hash(messages, enable_thinking),
             }
 
             on_complete(sid, generated_text, proof)

@@ -257,10 +257,12 @@ class RunnerExecutor:
                             except Exception as e:
                                 print(f"[verify-log] error while logging proof diagnostics: {e} for request_id = {request_id}")
                             forced_ids = [t["id"] for t in proof_obj["tokens"]]
+                            proof_prompt_hash = proof_obj.get("prompt_hash", "")
                             # In check mode, limit generation exactly to proof length
                             max_new_tokens = len(forced_ids)
                         else:
                             forced_ids = None
+                            proof_prompt_hash = None
                         def on_token(sid, txt, meta, rq=req):
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[stream] req={rq['uuid']} sid={sid[:6]} token={meta.get('id')} txt='{txt}' for request_id = {request_id}")
@@ -297,7 +299,7 @@ class RunnerExecutor:
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         # Pick the least loaded replica and submit
                         target_tm = self._pick_transformers_manager()
-                        target_tm.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids, tools=tools)
+                        target_tm.submit_continuous(messages, enable_thinking, sampling_cfg, max_new_tokens, on_token, on_complete, is_check=is_check, forced_tokens=forced_ids, tools=tools, proof_prompt_hash=proof_prompt_hash if is_check else None)
                     # elif model in SANA_MODEL_CONFIG and self.sana_model_manager is not None:
                     #     def on_finished(_idx, output, rq=req):
                     #         with self.lock:
