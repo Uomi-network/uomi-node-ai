@@ -218,6 +218,37 @@ class VLLMModelManager:
     # Internal generation
     # ------------------------------------------------------------------
 
+    def _topk_ids_from_logprobs(self, top_logprobs: list) -> set:
+        """
+        Convert OpenAI-format top_logprobs entries to a set of token IDs.
+
+        Each entry is {"token": str, "logprob": float, "bytes": [int, ...]}.
+        Two strategies are tried in order for each entry:
+          1. tokenizer.encode(token_text) — works for most standard tokens.
+          2. tokenizer.convert_tokens_to_ids(token_text) — works for raw vocab tokens
+             that encode() would split differently.
+        """
+        if self._tokenizer is None:
+            return set()
+        top_ids: set = set()
+        for lp in top_logprobs:
+            tok_text = lp.get("token", "")
+            # Strategy 1: encode the decoded token text directly.
+            try:
+                ids = self._tokenizer.encode(tok_text, add_special_tokens=False)
+                if len(ids) == 1:
+                    top_ids.add(ids[0])
+            except Exception:
+                pass
+            # Strategy 2: direct vocab lookup (handles raw BPE / SentencePiece tokens).
+            try:
+                tok_id = self._tokenizer.convert_tokens_to_ids(tok_text)
+                if isinstance(tok_id, int) and tok_id != self._tokenizer.unk_token_id:
+                    top_ids.add(tok_id)
+            except Exception:
+                pass
+        return top_ids
+
     def _encode_tokens(self, text: str) -> List[int]:
         """
         Encode *full* response text in one call.
@@ -271,6 +302,8 @@ class VLLMModelManager:
                     m["tool_calls"] = fixed_calls
                 patched_messages.append(m)
 
+            topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "10"))
+
             payload: Dict[str, Any] = {
                 "model": self.model_name,
                 "messages": patched_messages,
@@ -280,6 +313,11 @@ class VLLMModelManager:
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": enable_thinking},
             }
+            # In check mode request logprobs so we can do top-K verification
+            # instead of requiring exact token match (which fails with temperature > 0).
+            if is_check and forced_tokens is not None:
+                payload["logprobs"] = True
+                payload["top_logprobs"] = topk_verify
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
@@ -328,7 +366,27 @@ class VLLMModelManager:
 
             # Build proof
             if is_check and forced_tokens is not None:
-                verified = generated_ids == list(forced_tokens)
+                lp_content = (data["choices"][0].get("logprobs") or {}).get("content") or []
+                forced_list = list(forced_tokens)
+
+                if not lp_content or self._tokenizer is None:
+                    # No logprobs available: fall back to exact match
+                    verified = generated_ids == forced_list
+                    print(f"[verify-log] exact-match fallback: verified={verified}")
+                elif len(lp_content) != len(forced_list):
+                    verified = False
+                    print(f"[verify-log] length mismatch: got={len(lp_content)} expected={len(forced_list)}")
+                else:
+                    verified = True
+                    for i, (forced_id, lp_pos) in enumerate(zip(forced_list, lp_content)):
+                        top_ids = self._topk_ids_from_logprobs(lp_pos.get("top_logprobs") or [])
+                        if int(forced_id) not in top_ids:
+                            verified = False
+                            print(f"[verify-log] position {i}: forced_id={forced_id} not in top-{topk_verify} ids={top_ids}")
+                            break
+                    if verified:
+                        print(f"[verify-log] top-{topk_verify} verification passed ({len(forced_list)} tokens)")
+
                 proof: Dict[str, Any] = {
                     "tokens": [{"id": int(t)} for t in generated_ids],
                     "verified": verified,
