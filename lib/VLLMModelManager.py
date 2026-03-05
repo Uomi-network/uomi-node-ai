@@ -49,7 +49,7 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     model_name="Qwen/Qwen3.5-35B-A3B-FP8",
     tensor_parallel_size=2,
     dtype="auto",
-    max_model_len=16384,
+    max_model_len=32768,
     gpu_memory_utilization=0.95,
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
