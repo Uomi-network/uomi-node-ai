@@ -54,9 +54,8 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
     hf_overrides={"architectures": ["Qwen3_5MoeForCausalLM"]},
-    # FP8 KV cache: halves KV memory vs FP16, doubling effective max batch size.
-    # RTX 4090 (Ada Lovelace) supports native FP8 ops; fp8_e5m2 is the vLLM standard.
-    extra_serve_args=["--kv-cache-dtype", "fp8_e5m2"],
+    # To enable FP8 KV cache (doubles effective batch size, requires vLLM >= 0.4.3):
+    #   extra_serve_args=["--kv-cache-dtype", "fp8"],
 )
 
 
