@@ -499,6 +499,7 @@ class VLLMModelManager:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
 
+            print(f"[vllm-req] roles={[m.get('role') for m in patched_messages]}")
             body = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
                 f"{self._base_url}/v1/chat/completions",
