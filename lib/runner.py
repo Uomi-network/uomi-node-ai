@@ -210,6 +210,10 @@ class RunnerExecutor:
                         import json
                         payload = json.loads(input_json)
                         messages = payload["messages"]
+                        # Chat templates require system message first
+                        system_msgs = [m for m in messages if m.get("role") == "system"]
+                        other_msgs  = [m for m in messages if m.get("role") != "system"]
+                        messages = system_msgs + other_msgs
                         tools = payload.get("tools") or None
                         enable_thinking = payload.get("enable_thinking", req["request"].get("enable_thinking", True))
                         # Allow optional per-request sampling / max tokens overrides
