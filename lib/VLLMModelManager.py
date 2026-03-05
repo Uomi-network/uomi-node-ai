@@ -220,6 +220,19 @@ class VLLMModelManager:
     # Internal generation
     # ------------------------------------------------------------------
 
+    def _get_stop_token_ids(self) -> List[int]:
+        """Return EOS and common chat-template end tokens from the tokenizer."""
+        if self._tokenizer is None:
+            return []
+        stop_ids: List[int] = []
+        if self._tokenizer.eos_token_id is not None:
+            stop_ids.append(int(self._tokenizer.eos_token_id))
+        for special in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>"):
+            tid = self._tokenizer.convert_tokens_to_ids(special)
+            if isinstance(tid, int) and tid not in stop_ids:
+                stop_ids.append(tid)
+        return stop_ids
+
     def _verify_topk(
         self,
         messages: List[Dict],
@@ -230,11 +243,16 @@ class VLLMModelManager:
         """
         Verify each forced token is within the top-K candidates at its position.
 
+        Three layered checks:
+          1. Top-K per-token:  actual_logprob >= K-th best logprob at each position
+          2. EOS completeness: last token must be an EOS/stop token (rejects truncated
+             or padded-with-extra-tokens proofs)
+          3. Mean logprob:     average logprob must exceed VLLM_MIN_MEAN_LOGPROB
+             (rejects sequences that happen to be in top-K but are incoherent
+             because they come from a completely different prompt context)
+
         Uses /v1/completions with echo=True and token IDs as prompt.
-        Comparison is purely logprob-based — no token text-to-ID conversion needed:
-          token_logprobs[n_prompt+i]    = log P(forced_tokens[i] | correct prefix)
-          min(top_logprobs[n_prompt+i]) = log P of the K-th best token at that position
-          → passes iff actual_logprob >= kth_logprob
+        Comparison is purely logprob-based — no token text-to-ID conversion needed.
 
         Returns True (pass), False (fail), or None (cannot verify — caller decides).
         """
@@ -245,6 +263,20 @@ class VLLMModelManager:
         if not forced_tokens:
             print("[verify-log] FAIL: empty forced_tokens")
             return False
+
+        # --- Check 2: EOS completeness ---
+        stop_ids = self._get_stop_token_ids()
+        if stop_ids and forced_tokens[-1] not in stop_ids:
+            last_text = ""
+            try:
+                last_text = self._tokenizer.decode([int(forced_tokens[-1])], skip_special_tokens=False)
+            except Exception:
+                pass
+            print(f"[verify-log] FAIL: last token id={forced_tokens[-1]} ('{last_text}') "
+                  f"is not a stop token (stop_ids={stop_ids[:5]})")
+            return False
+
+        min_mean_logprob = float(os.getenv("VLLM_MIN_MEAN_LOGPROB", "-3.0"))
 
         try:
             try:
@@ -297,6 +329,8 @@ class VLLMModelManager:
                 print(f"[verify-log] FAIL: logprobs slice too short ({len(resp_actual_lp)} < {n_resp})")
                 return False
 
+            # --- Check 1: top-K per-token ---
+            valid_lps: List[float] = []
             for i, (forced_id, actual_lp, top_lp_dict) in enumerate(
                     zip(forced_tokens, resp_actual_lp, resp_top_lp)):
                 if actual_lp is None:
@@ -318,6 +352,15 @@ class VLLMModelManager:
                     print(f"[verify-log] FAIL pos {i}: id={forced_id} ('{forced_text}') "
                           f"logprob={actual_lp:.4f} < kth={kth_logprob:.4f} "
                           f"top_tokens={top_sample}")
+                    return False
+                valid_lps.append(actual_lp)
+
+            # --- Check 3: mean logprob threshold ---
+            if valid_lps:
+                mean_lp = sum(valid_lps) / len(valid_lps)
+                print(f"[verify-log] mean logprob={mean_lp:.4f} threshold={min_mean_logprob}")
+                if mean_lp < min_mean_logprob:
+                    print(f"[verify-log] FAIL: mean logprob {mean_lp:.4f} < threshold {min_mean_logprob}")
                     return False
 
             print(f"[verify-log] PASS: all {n_resp} tokens verified in top-{topk_verify}")
@@ -359,7 +402,7 @@ class VLLMModelManager:
             # correct prefix context at every position.
             # ------------------------------------------------------------------
             if is_check and forced_tokens is not None:
-                topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "10"))
+                topk_verify = int(os.getenv("VLLM_TOPK_VERIFY", "5"))
                 verified_opt = self._verify_topk(messages, enable_thinking, list(forced_tokens), topk_verify)
                 verified = bool(verified_opt) if verified_opt is not None else False
                 if verified_opt is None:
