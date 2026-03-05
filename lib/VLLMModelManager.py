@@ -490,6 +490,12 @@ class VLLMModelManager:
             # Encode the FULL response text in one shot — never chunk-by-chunk.
             generated_ids = self._encode_tokens(generated_text)
 
+            # Append EOS/stop token so the proof encodes sequence completeness.
+            # Without this, truncated proofs would be indistinguishable from full ones.
+            stop_token_ids = self._get_stop_token_ids()
+            if stop_token_ids:
+                generated_ids = generated_ids + [stop_token_ids[0]]
+
             # Fire on_token for each token (used only for debug logging in runner.py)
             for i, tid in enumerate(generated_ids):
                 try:
