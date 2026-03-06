@@ -112,8 +112,6 @@ class VLLMModelManager:
             "--port", str(cfg.port),
             "--trust-remote-code",
             "--enforce-eager",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser", os.environ.get("VLLM_TOOL_CALL_PARSER", "hermes"),
         ]
         if cfg.hf_overrides:
             cmd += ["--hf-overrides", json.dumps(cfg.hf_overrides)]
