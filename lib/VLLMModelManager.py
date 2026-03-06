@@ -552,7 +552,7 @@ class VLLMModelManager:
             }
             if tools:
                 payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+                payload["tool_choice"] = "none"
 
             print(f"[vllm-req] roles={[m.get('role') for m in patched_messages]}")
             body = json.dumps(payload).encode("utf-8")
