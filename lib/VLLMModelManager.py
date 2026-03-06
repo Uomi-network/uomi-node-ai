@@ -39,7 +39,7 @@ class VLLMModelConfig:
     tensor_parallel_size: int = 2
     dtype: str = "auto"
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.96
+    gpu_memory_utilization: float = 0.9,
     port: int = 8100          # REST port for vllm serve (not Flask's 8888)
     hf_overrides: Optional[Dict[str, Any]] = None
     extra_serve_args: List[str] = field(default_factory=list)
@@ -50,7 +50,7 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     tensor_parallel_size=2,
     dtype="auto",
     max_model_len=32678,
-    gpu_memory_utilization=0.95,
+    gpu_memory_utilization=0.9,
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
     hf_overrides={"architectures": ["Qwen3_5MoeForCausalLM"]},
@@ -160,14 +160,32 @@ class VLLMModelManager:
         raise RuntimeError(f"vllm serve did not become ready within {timeout}s")
 
     def _start_health_watcher(self):
-        """Background thread: restarts vllm serve if it crashes."""
+        """Background thread: restarts vllm serve if it crashes or becomes unhealthy."""
         def _watch():
             while True:
                 time.sleep(10)
                 if self._proc is None:
                     continue
-                if self._proc.poll() is not None:          # process exited
+                # Case 1: process exited entirely
+                if self._proc.poll() is not None:
                     print(f"[vllm-serve] Server process exited (rc={self._proc.returncode}), restarting…")
+                    try:
+                        self._restart_server()
+                    except Exception as exc:
+                        print(f"[vllm-serve] Auto-restart failed: {exc}")
+                    continue
+                # Case 2: server_ready was cleared (e.g. 5xx OOM) — verify /health
+                if not self._server_ready.is_set():
+                    url = f"{self._base_url}/health"
+                    try:
+                        with urllib.request.urlopen(url, timeout=5) as r:
+                            if r.status == 200:
+                                print("[vllm-serve] /health OK after transient error, marking ready ✓")
+                                self._server_ready.set()
+                                continue
+                    except Exception:
+                        pass
+                    print("[vllm-serve] server_ready cleared and /health not OK — restarting…")
                     try:
                         self._restart_server()
                     except Exception as exc:
@@ -383,8 +401,21 @@ class VLLMModelManager:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                comp_data = json.loads(resp.read())
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    comp_data = json.loads(resp.read())
+            except urllib.error.HTTPError as _http_err:
+                err_body = ""
+                try:
+                    err_body = _http_err.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                print(f"[verify-log] completions HTTP {_http_err.code}: {err_body[:300]}")
+                if _http_err.code >= 500:
+                    # vLLM engine likely crashed (OOM etc.) — trigger health watcher restart
+                    print("[verify-log] 5xx from vLLM during verify — marking server not ready for restart")
+                    self._server_ready.clear()
+                return None
 
             lp_data = comp_data["choices"][0].get("logprobs") or {}
             # token_logprobs[i] = log P(token_i | token_0..i-1)
