@@ -77,7 +77,23 @@ def run_json():
     time_start = time.time()
 
     print('💬 Received request...')
-    data = request.get_json()
+
+    # ── DEBUG: dump everything arriving at /run ──────────────────────────
+    try:
+        _dbg_headers = dict(request.headers)
+        _dbg_raw     = request.get_data(as_text=True)
+        _dbg_content = request.content_type
+        print(f"[DEBUG /run] Content-Type: {_dbg_content}")
+        print(f"[DEBUG /run] Headers: {json.dumps(_dbg_headers, indent=2)}")
+        print(f"[DEBUG /run] Raw body ({len(_dbg_raw)} chars): {_dbg_raw[:4096]}")
+    except Exception as _dbg_exc:
+        print(f"[DEBUG /run] Could not dump request: {_dbg_exc}")
+    # ────────────────────────────────────────────────────────────────────
+
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        print('❌ Could not parse JSON body')
+        return jsonify({"error": "invalid JSON body"}), 400
 
     # Check if the response can be returned from cache
     body_hash = None
