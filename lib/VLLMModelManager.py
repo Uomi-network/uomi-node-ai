@@ -49,7 +49,7 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     model_name="Qwen/Qwen3.5-35B-A3B-FP8",
     tensor_parallel_size=2,
     dtype="auto",
-    max_model_len=65536,
+    max_model_len=32678,
     gpu_memory_utilization=0.95,
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
@@ -84,7 +84,10 @@ class VLLMModelManager:
 
         # Tokenizer loaded via transformers (CPU only — used for token ID encoding)
         self._tokenizer = self._load_tokenizer()
+        self._server_lock = threading.Lock()   # serialise restarts
+        self._server_ready = threading.Event() # set when server is healthy
         self._start_server()
+        self._start_health_watcher()
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -128,19 +131,12 @@ class VLLMModelManager:
             return None
 
     def _start_server(self):
-        cmd = self._build_cmd()
-        print(f"[vllm-serve] Starting: {' '.join(cmd)}", flush=True)
         # Don't capture stdout/stderr — let vllm write directly to the journal
         # so HuggingFace download progress bars are visible in `journalctl -f`.
-        self._proc = subprocess.Popen(
-            cmd,
-            env=os.environ.copy(),
-            preexec_fn=os.setsid,
-        )
+        self._start_server_proc()
         self._wait_for_ready(timeout=600)
 
     def _wait_for_ready(self, timeout: int = 600):
-        import urllib.request, urllib.error
         url = f"{self._base_url}/health"
         deadline = time.time() + timeout
         last_log = 0.0
@@ -155,6 +151,7 @@ class VLLMModelManager:
                 with urllib.request.urlopen(url, timeout=2) as r:
                     if r.status == 200:
                         print("[vllm-serve] Server ready ✓")
+                        self._server_ready.set()
                         return
             except Exception:
                 pass
@@ -163,6 +160,50 @@ class VLLMModelManager:
                 last_log = time.time()
             time.sleep(2)
         raise RuntimeError(f"vllm serve did not become ready within {timeout}s")
+
+    def _start_health_watcher(self):
+        """Background thread: restarts vllm serve if it crashes."""
+        def _watch():
+            while True:
+                time.sleep(10)
+                if self._proc is None:
+                    continue
+                if self._proc.poll() is not None:          # process exited
+                    print(f"[vllm-serve] Server process exited (rc={self._proc.returncode}), restarting…")
+                    try:
+                        self._restart_server()
+                    except Exception as exc:
+                        print(f"[vllm-serve] Auto-restart failed: {exc}")
+        t = threading.Thread(target=_watch, daemon=True, name="vllm-health-watcher")
+        t.start()
+
+    def _restart_server(self):
+        """Kill any existing process and bring up a fresh vllm serve."""
+        with self._server_lock:
+            self._server_ready.clear()
+            # Kill old process group
+            if self._proc and self._proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                    self._proc.wait(timeout=15)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+            time.sleep(2)   # brief pause before re-binding the port
+            self._start_server_proc()
+            self._wait_for_ready(timeout=600)
+
+    def _start_server_proc(self):
+        """Launch the subprocess without waiting for readiness."""
+        cmd = self._build_cmd()
+        print(f"[vllm-serve] Starting: {' '.join(cmd)}", flush=True)
+        self._proc = subprocess.Popen(
+            cmd,
+            env=os.environ.copy(),
+            preexec_fn=os.setsid,
+        )
 
     def shutdown(self):
         if self._proc and self._proc.poll() is None:
@@ -430,6 +471,15 @@ class VLLMModelManager:
         tools: Optional[List[Dict]] = None,
         proof_prompt_hash: Optional[str] = None,
     ):
+        # Wait until the server is ready (covers the case where it just restarted).
+        # Timeout after 660 s to avoid hanging threads indefinitely.
+        if not self._server_ready.wait(timeout=660):
+            print(f"[vllm-serve] _run timeout waiting for server ready (sid={sid[:6]})")
+            on_complete(sid, "", {"tokens": [], "error": "server not ready"})
+            with self._lock:
+                self._active_count -= 1
+            return
+
         try:
             # ------------------------------------------------------------------
             # CHECK PATH: top-K verification via /v1/completions echo=True.
