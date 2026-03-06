@@ -79,3 +79,4 @@ class System:
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         os.environ["TRANSFORMERS_CACHE"] = MODELS_FOLDER
         os.environ["HF_HOME"] = MODELS_FOLDER
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
