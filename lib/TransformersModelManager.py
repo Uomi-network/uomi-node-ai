@@ -10,7 +10,7 @@ _alloc_parts = [p for p in _alloc_conf.split(',') if p]
 if 'expandable_segments' not in _alloc_conf:
     _alloc_parts.append('expandable_segments:True')
 if 'max_split_size_mb' not in _alloc_conf:
-    _alloc_parts.append(f'max_split_size_mb:{os.environ.get("PYTORCH_MAX_SPLIT_MB", "256")}')
+    _alloc_parts.append(f'max_split_size_mb:{os.environ.get("PYTORCH_MAX_SPLIT_MB", "8192")}')
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(_alloc_parts)
 del _alloc_conf, _alloc_parts
 
