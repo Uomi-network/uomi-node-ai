@@ -54,8 +54,10 @@ QWEN35_35B_A3B_FP8_VLLM_CONFIG = VLLMModelConfig(
     port=8100,
     # HF config.json says Qwen3_5MoeForConditionalGeneration; vLLM class is Qwen3_5MoeForCausalLM
     hf_overrides={"architectures": ["Qwen3_5MoeForCausalLM"]},
-    # To enable FP8 KV cache (doubles effective batch size, requires vLLM >= 0.4.3):
-    #   extra_serve_args=["--kv-cache-dtype", "fp8"],
+    # Limit prefill chunk size to cap the logits tensor during logprob computation.
+    # At chunk=512: logits = 512 × 151936 vocab × float32 ≈ 312 MB/GPU (vs 1.25 GB at 2048).
+    # Without this, concurrent generate+verify causes OOM during log_softmax on 24 GB GPUs.
+    extra_serve_args=["--max-num-batched-tokens", "512"],
 )
 
 
