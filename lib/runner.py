@@ -282,6 +282,7 @@ class RunnerExecutor:
                             wrapped_proof = ""
                             result_flag = True
                             result_error = None
+                            metrics = {"tokens_in": 0, "tokens_out": 0}
                             try:
                                 if proof is not None:
                                     # Ensure proof contains verification flag when available
@@ -290,6 +291,15 @@ class RunnerExecutor:
                                     if isinstance(proof, dict) and proof.get('error'):
                                         result_flag = False
                                         result_error = str(proof.get('error'))
+                                    if isinstance(proof, dict):
+                                        tokens_out = len(proof.get('tokens', []) or [])
+                                        if 'prompt_tokens' in proof and isinstance(proof['prompt_tokens'], int):
+                                            tokens_in = max(0, proof['prompt_tokens'])
+                                        elif 'full_sequence_length' in proof and isinstance(proof['full_sequence_length'], int):
+                                            tokens_in = max(0, proof['full_sequence_length'] - tokens_out)
+                                        else:
+                                            tokens_in = 0
+                                        metrics = {"tokens_in": tokens_in, "tokens_out": tokens_out}
                                     wrapped_proof = zip_string(_j.dumps(proof))
                                 else:
                                     wrapped_proof = ""
@@ -302,9 +312,9 @@ class RunnerExecutor:
                                 # Provide an error field when verification failed so callers
                                 # can safely reference output['error'] without KeyError
                                 if result_flag:
-                                    rq["output"] = {"result": True, "response": response, "proof": wrapped_proof}
+                                    rq["output"] = {"result": True, "response": response, "proof": wrapped_proof, "metrics": metrics}
                                 else:
-                                    rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": result_error or "verification_failed"}
+                                    rq["output"] = {"result": False, "response": response, "proof": wrapped_proof, "error": result_error or "verification_failed", "metrics": metrics}
                             if os.getenv('CONTINUOUS_DEBUG','0') == '1':
                                 print(f"[complete] req={rq['uuid']} sid={sid[:6]} tokens={len(proof['tokens']) if proof else 0}")
                         # Pick the least loaded replica and submit

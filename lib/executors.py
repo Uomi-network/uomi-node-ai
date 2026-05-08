@@ -14,12 +14,26 @@ class AbstractExecutor:
             "error": message
         }
 
-    def _generate_output(self, response, proof=""):
-        return {
+    def _generate_output(self, response, proof="", metrics=None):
+        out = {
             "result": True,
             "response": response,
-            "proof": proof
+            "proof": proof,
+            "metrics": metrics if metrics is not None else {"tokens_in": 0, "tokens_out": 0},
         }
+        return out
+
+    def _metrics_from_proof(self, proof_dict):
+        if not isinstance(proof_dict, dict):
+            return {"tokens_in": 0, "tokens_out": 0}
+        tokens_out = len(proof_dict.get("tokens", []) or [])
+        if isinstance(proof_dict.get("prompt_tokens"), int):
+            tokens_in = max(0, proof_dict["prompt_tokens"])
+        elif isinstance(proof_dict.get("full_sequence_length"), int):
+            tokens_in = max(0, proof_dict["full_sequence_length"] - tokens_out)
+        else:
+            tokens_in = 0
+        return {"tokens_in": tokens_in, "tokens_out": tokens_out}
 
 class ChatExecutor(AbstractExecutor):
     def _validate_input(self, input):
@@ -120,7 +134,7 @@ class ChatExecutor(AbstractExecutor):
 
         # Run valid inputs
         def on_valid_input_finished(index, output):
-            on_input_finished(valid_inputs[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
+            on_input_finished(valid_inputs[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else "", self._metrics_from_proof(output.get('proof'))))
         model_manager.run_batch_executions([input["messages"] for input in valid_inputs], [input["enable_thinking"] for input in valid_inputs], on_valid_input_finished)
 
     def check(self, inputs, proofs, model_manager, on_input_finished):
@@ -145,7 +159,7 @@ class ChatExecutor(AbstractExecutor):
 
         # Run valid inputs
         def on_valid_input_finished(index, output):
-            on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else ""))
+            on_input_finished(valid_inputs_with_tokens[index]["index"], self._generate_output(output['response'], zip_string(json.dumps(output['proof'])) if output['proof'] is not None else "", self._metrics_from_proof(output.get('proof'))))
         model_manager.run_batch_checks([input["messages"] for input in valid_inputs_with_tokens], [input["enable_thinking"] for input in valid_inputs_with_tokens], [input["proof"] for input in valid_inputs_with_tokens], on_valid_input_finished)
 
 class ImageExecutor(AbstractExecutor):

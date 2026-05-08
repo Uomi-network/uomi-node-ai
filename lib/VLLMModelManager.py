@@ -476,6 +476,24 @@ class VLLMModelManager:
             print(f"[verify-log] _verify_topk error: {exc}")
             return None
 
+    def _count_prompt_tokens(self, messages: List[Dict], enable_thinking: bool) -> int:
+        """Number of input tokens in the chat-template-rendered prompt."""
+        if self._tokenizer is None:
+            return 0
+        try:
+            try:
+                ids = self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                ids = self._tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                )
+            return len(list(ids))
+        except Exception:
+            return 0
+
     def _encode_tokens(self, text: str) -> List[int]:
         """
         Encode *full* response text in one call.
@@ -534,7 +552,13 @@ class VLLMModelManager:
                     except Exception:
                         pass
 
-                proof_obj: Dict[str, Any] = {"tokens": [{"id": int(t)} for t in generated_ids], "verified": verified}
+                prompt_tokens = self._count_prompt_tokens(messages, enable_thinking)
+                proof_obj: Dict[str, Any] = {
+                    "tokens": [{"id": int(t)} for t in generated_ids],
+                    "verified": verified,
+                    "prompt_tokens": prompt_tokens,
+                    "full_sequence_length": prompt_tokens + len(generated_ids),
+                }
                 if not verified:
                     proof_obj["error"] = "token_mismatch"
                 on_complete(sid, response_text, proof_obj)
@@ -633,9 +657,12 @@ class VLLMModelManager:
                 except Exception:
                     pass
 
+            prompt_tokens = self._count_prompt_tokens(messages, enable_thinking)
             proof: Dict[str, Any] = {
                 "tokens": [{"id": int(t)} for t in generated_ids],
                 "prompt_hash": self._compute_prompt_hash(messages, enable_thinking),
+                "prompt_tokens": prompt_tokens,
+                "full_sequence_length": prompt_tokens + len(generated_ids),
             }
 
             on_complete(sid, generated_text, proof)
